@@ -13,8 +13,9 @@ const WORKFLOW_PATH = join(process.cwd(), 'flux.2.klein.json');
 const INPUT_DIR = join(process.cwd(), 'ComfyUI', 'input');
 const OUTPUT_DIR = join(process.cwd(), 'ComfyUI', 'output');
 
-// Identity from Salad instance environment or machine hostname
-const MACHINE_ID = process.env.SALAD_MACHINE_ID || process.env.SALAD_CONTAINER_GROUP_INSTANCE_ID || os.hostname();
+// Identity: Use RunPod's built-in container POD ID if available, otherwise hostname
+const RUNPOD_POD_ID = process.env.RUNPOD_POD_ID;
+const MACHINE_ID = RUNPOD_POD_ID || os.hostname();
 
 // Central Backend Configuration (Hardcoded)
 const API_BASE_URL = 'https://api.runltx.com';
@@ -27,13 +28,9 @@ const MAX_EMPTY_POLLS = 10; // 10 polls * 3s = 30 seconds of inactivity before s
 let WORKER_SECRET = null;
 
 // ============================================
-// Salad Cloud Configuration (Auto-Shutdown)
+// RunPod Configuration (Auto-Shutdown)
 // ============================================
-const SALAD_API_URL = 'https://api.salad.com/api/public';
-const SALAD_API_KEY = process.env.SALAD_API_KEY;
-const SALAD_ORG_NAME = process.env.SALAD_ORG_NAME;
-const SALAD_PROJECT_NAME = process.env.SALAD_PROJECT_NAME;
-const SALAD_CONTAINER_GROUP_NAME = process.env.SALAD_CONTAINER_GROUP_NAME || 'flux-image-edit-worker';
+const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY;
 
 // ============================================
 // R2 Storage Client
@@ -63,30 +60,39 @@ const get_api_headers = () => ({
     'content-type': 'application/json'
 });
 
-const stop_salad_container_group = async () => {
-    if (!SALAD_API_KEY || !SALAD_ORG_NAME || !SALAD_PROJECT_NAME) {
-        console.warn('[Shutdown] Salad credentials missing in environment. Cannot execute /stop.');
+const stop_runpod_instance = async () => {
+    if (!RUNPOD_API_KEY || !RUNPOD_POD_ID) {
+        console.warn('[Shutdown] RUNPOD_API_KEY or RUNPOD_POD_ID missing in environment. Cannot execute GraphQL podStop.');
         return false;
     }
 
     try {
-        console.log(`[Shutdown] Inactivity threshold reached. Stopping container group '${SALAD_CONTAINER_GROUP_NAME}'...`);
-        const url = `${SALAD_API_URL}/organizations/${SALAD_ORG_NAME}/projects/${SALAD_PROJECT_NAME}/containers/${SALAD_CONTAINER_GROUP_NAME}/stop`;
+        console.log(`[Shutdown] Inactivity threshold reached. Stopping RunPod '${RUNPOD_POD_ID}'...`);
         
-        const res = await fetch(url, {
+        const query = `
+          mutation {
+            podStop(input: { podId: "${RUNPOD_POD_ID}" }) {
+              id
+              desiredStatus
+            }
+          }
+        `;
+
+        const res = await fetch('https://api.runpod.io/graphql', {
             method: 'POST',
             headers: {
-                'Salad-Api-Key': SALAD_API_KEY,
-                'Content-Type': 'application/json'
-            }
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${RUNPOD_API_KEY}`
+            },
+            body: JSON.stringify({ query })
         });
 
-        if (!res.ok) {
-            const err_text = await res.text();
-            throw new Error(`Salad stop error HTTP ${res.status}: ${err_text}`);
+        const data = await res.json();
+        if (data.errors) {
+            throw new Error(`RunPod GraphQL error: ${JSON.stringify(data.errors)}`);
         }
 
-        console.log('[Shutdown] Container group successfully stopped via SaladCloud API.');
+        console.log('[Shutdown] Pod stop request successful:', data.data?.podStop);
         return true;
     } catch (err) {
         console.error('[Shutdown Error]:', err.message);
@@ -338,8 +344,8 @@ const worker_loop = async () => {
                 console.log(`[Worker] No jobs available (${empty_poll_count}/${MAX_EMPTY_POLLS})`);
 
                 if (empty_poll_count >= MAX_EMPTY_POLLS) {
-                    console.log('[Worker] Idle threshold reached. Initiating Salad container shutdown...');
-                    await stop_salad_container_group();
+                    console.log('[Worker] Idle threshold reached. Initiating RunPod shutdown...');
+                    await stop_runpod_instance();
                     process.exit(0);
                 }
 
@@ -347,7 +353,7 @@ const worker_loop = async () => {
                 continue;
             }
 
-            // Reset counter when a job is received
+            // Reset counter when a job is processed
             empty_poll_count = 0;
             await process_job(result.data);
             await sleep(1000);
