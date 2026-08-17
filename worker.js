@@ -65,29 +65,28 @@ const get_api_headers = () => ({
 
 const stop_salad_container_group = async () => {
     if (!SALAD_API_KEY || !SALAD_ORG_NAME || !SALAD_PROJECT_NAME) {
-        console.warn('[Shutdown] Salad credentials missing in environment. Cannot scale down via API.');
+        console.warn('[Shutdown] Salad credentials missing in environment. Cannot execute /stop.');
         return false;
     }
 
     try {
-        console.log(`[Shutdown] Inactivity threshold reached. Scaling container group '${SALAD_CONTAINER_GROUP_NAME}' to 0 replicas...`);
-        const url = `${SALAD_API_URL}/organizations/${SALAD_ORG_NAME}/projects/${SALAD_PROJECT_NAME}/containers/${SALAD_CONTAINER_GROUP_NAME}`;
+        console.log(`[Shutdown] Inactivity threshold reached. Stopping container group '${SALAD_CONTAINER_GROUP_NAME}'...`);
+        const url = `${SALAD_API_URL}/organizations/${SALAD_ORG_NAME}/projects/${SALAD_PROJECT_NAME}/containers/${SALAD_CONTAINER_GROUP_NAME}/stop`;
         
         const res = await fetch(url, {
-            method: 'PATCH',
+            method: 'POST',
             headers: {
                 'Salad-Api-Key': SALAD_API_KEY,
                 'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ replicas: 0 })
+            }
         });
 
         if (!res.ok) {
             const err_text = await res.text();
-            throw new Error(`Salad scale-down error HTTP ${res.status}: ${err_text}`);
+            throw new Error(`Salad stop error HTTP ${res.status}: ${err_text}`);
         }
 
-        console.log('[Shutdown] Successfully scaled container group to 0 replicas.');
+        console.log('[Shutdown] Container group successfully stopped via SaladCloud API.');
         return true;
     } catch (err) {
         console.error('[Shutdown Error]:', err.message);
