@@ -15,12 +15,13 @@ const OUTPUT_DIR = join(process.cwd(), 'ComfyUI', 'output');
 
 // Identity from Salad instance environment or machine hostname
 const MACHINE_ID = process.env.SALAD_MACHINE_ID || process.env.SALAD_CONTAINER_GROUP_INSTANCE_ID || os.hostname();
-const API_BASE_URL = process.env.API_BASE_URL || 'https://api.runltx.com';
-const POLL_INTERVAL_SECONDS = parseInt(process.env.POLL_INTERVAL_SECONDS, 10) || 3;
-const MAX_RETRY_COUNT = 2;
 
-const JOB_TYPE = process.env.JOB_TYPE || 'generate';
-const MODEL_TYPE = process.env.MODEL_TYPE || 'image-edit';
+// Central Backend Configuration (Hardcoded)
+const API_BASE_URL = 'https://api.runltx.com';
+const JOB_TYPE = 'generate';
+const MODEL_TYPE = 'image-edit';
+const POLL_INTERVAL_SECONDS = 3;
+const MAX_RETRY_COUNT = 2;
 
 let WORKER_SECRET = null;
 
