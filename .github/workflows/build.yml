@@ -13,17 +13,6 @@ jobs:
       packages: write
 
     steps:
-      - name: Free Disk Space on GitHub Runner
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -59,6 +48,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          secrets: |
-            HF_TOKEN=${{ secrets.HF_TOKEN }}
-
