@@ -27,7 +27,7 @@ if [ -n "$HF_TOKEN" ]; then
     AUTH_HEADER="--header=Authorization: Bearer ${HF_TOKEN}"
 fi
 
-# Download helper function
+# Download helper function with DNS fallback
 download_if_missing() {
     local target_dir="$1"
     local file_name="$2"
@@ -37,8 +37,21 @@ download_if_missing() {
         echo "[Storage] Found '${file_name}' on persistent storage. Skipping download."
     else
         echo "[Storage] Missing '${file_name}'. Downloading via aria2..."
-        aria2c -x 8 -s 8 -k 1M $AUTH_HEADER \
-            -d "${target_dir}" -o "${file_name}" "${url}"
+        
+        # 1. Attempt with aria2c using OS system DNS resolver
+        if ! aria2c -x 8 -s 8 -k 1M \
+            --async-dns=false \
+            --max-tries=5 \
+            --retry-wait=2 \
+            $AUTH_HEADER \
+            -d "${target_dir}" -o "${file_name}" "${url}"; then
+            
+            echo "[Storage Warning] aria2c download failed. Falling back to wget..."
+            
+            # 2. Fallback to wget
+            WGET_AUTH=$([ -n "$HF_TOKEN" ] && echo "--header=Authorization: Bearer ${HF_TOKEN}" || echo "")
+            wget --quiet --show-progress -c $WGET_AUTH -O "${target_dir}/${file_name}" "${url}"
+        fi
     fi
 }
 
