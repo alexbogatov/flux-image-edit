@@ -22,8 +22,18 @@ const JOB_TYPE = 'generate';
 const MODEL_TYPE = 'image-edit';
 const POLL_INTERVAL_SECONDS = 3;
 const MAX_RETRY_COUNT = 2;
+const MAX_EMPTY_POLLS = 10; // 10 polls * 3s = 30 seconds of inactivity before shutdown
 
 let WORKER_SECRET = null;
+
+// ============================================
+// Salad Cloud Configuration (Auto-Shutdown)
+// ============================================
+const SALAD_API_URL = 'https://api.salad.com/api/public';
+const SALAD_API_KEY = process.env.SALAD_API_KEY;
+const SALAD_ORG_NAME = process.env.SALAD_ORG_NAME;
+const SALAD_PROJECT_NAME = process.env.SALAD_PROJECT_NAME;
+const SALAD_CONTAINER_GROUP_NAME = process.env.SALAD_CONTAINER_GROUP_NAME || 'flux-image-edit-worker';
 
 // ============================================
 // R2 Storage Client
@@ -44,7 +54,7 @@ const s3_client = new S3Client({
 });
 
 // ============================================
-// Helper Functions
+// Helper Functions & Lifecycle Control
 // ============================================
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -53,6 +63,41 @@ const get_api_headers = () => ({
     'content-type': 'application/json'
 });
 
+const stop_salad_container_group = async () => {
+    if (!SALAD_API_KEY || !SALAD_ORG_NAME || !SALAD_PROJECT_NAME) {
+        console.warn('[Shutdown] Salad credentials missing in environment. Cannot scale down via API.');
+        return false;
+    }
+
+    try {
+        console.log(`[Shutdown] Inactivity threshold reached. Scaling container group '${SALAD_CONTAINER_GROUP_NAME}' to 0 replicas...`);
+        const url = `${SALAD_API_URL}/organizations/${SALAD_ORG_NAME}/projects/${SALAD_PROJECT_NAME}/containers/${SALAD_CONTAINER_GROUP_NAME}`;
+        
+        const res = await fetch(url, {
+            method: 'PATCH',
+            headers: {
+                'Salad-Api-Key': SALAD_API_KEY,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ replicas: 0 })
+        });
+
+        if (!res.ok) {
+            const err_text = await res.text();
+            throw new Error(`Salad scale-down error HTTP ${res.status}: ${err_text}`);
+        }
+
+        console.log('[Shutdown] Successfully scaled container group to 0 replicas.');
+        return true;
+    } catch (err) {
+        console.error('[Shutdown Error]:', err.message);
+        return false;
+    }
+};
+
+// ============================================
+// Central Backend API Handshakes
+// ============================================
 const register_with_api = async () => {
     console.log(`[Worker Init] Registering '${MACHINE_ID}' for model '${MODEL_TYPE}'...`);
 
@@ -282,6 +327,7 @@ const worker_loop = async () => {
     await mkdir(OUTPUT_DIR, { recursive: true });
     await wait_for_comfy_ready();
 
+    let empty_poll_count = 0;
     console.log(`[Worker] Polling for '${MODEL_TYPE}' jobs every ${POLL_INTERVAL_SECONDS}s...`);
 
     while (true) {
@@ -289,10 +335,21 @@ const worker_loop = async () => {
             const result = await poll_for_job();
 
             if (!result || !result.success || !result.data) {
+                empty_poll_count++;
+                console.log(`[Worker] No jobs available (${empty_poll_count}/${MAX_EMPTY_POLLS})`);
+
+                if (empty_poll_count >= MAX_EMPTY_POLLS) {
+                    console.log('[Worker] Idle threshold reached. Initiating Salad container shutdown...');
+                    await stop_salad_container_group();
+                    process.exit(0);
+                }
+
                 await sleep(POLL_INTERVAL_SECONDS * 1000);
                 continue;
             }
 
+            // Reset counter when a job is received
+            empty_poll_count = 0;
             await process_job(result.data);
             await sleep(1000);
         } catch (err) {
