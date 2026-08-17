@@ -1,0 +1,272 @@
+{
+  "9": {
+    "inputs": {
+      "filename_prefix": "Flux2-Klein-4b-base",
+      "images": [
+        "75:65",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "76": {
+    "inputs": {
+      "image": "a4958f8dab290b758278eb7f7154dfba9becf74a03967694dfe248eb56fb9d40.jpg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "75:61": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "75:62": {
+    "inputs": {
+      "steps": 20,
+      "width": [
+        "75:100",
+        0
+      ],
+      "height": [
+        "75:100",
+        1
+      ]
+    },
+    "class_type": "Flux2Scheduler",
+    "_meta": {
+      "title": "Flux2Scheduler"
+    }
+  },
+  "75:63": {
+    "inputs": {
+      "cfg": 5,
+      "model": [
+        "75:70",
+        0
+      ],
+      "positive": [
+        "75:124",
+        0
+      ],
+      "negative": [
+        "75:122",
+        0
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFG Guider"
+    }
+  },
+  "75:64": {
+    "inputs": {
+      "noise": [
+        "75:73",
+        0
+      ],
+      "guider": [
+        "75:63",
+        0
+      ],
+      "sampler": [
+        "75:61",
+        0
+      ],
+      "sigmas": [
+        "75:62",
+        0
+      ],
+      "latent_image": [
+        "75:66",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "75:65": {
+    "inputs": {
+      "samples": [
+        "75:64",
+        0
+      ],
+      "vae": [
+        "75:72",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "75:73": {
+    "inputs": {
+      "noise_seed": 111360610007833
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "75:70": {
+    "inputs": {
+      "unet_name": "flux-2-klein-base-4b-fp8.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "75:71": {
+    "inputs": {
+      "clip_name": "qwen_3_4b.safetensors",
+      "type": "flux2",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "75:74": {
+    "inputs": {
+      "text": "CRITICAL MANDATE: ABSOLUTE WATERMARK REMOVAL FIRST.\nCompletely erase all post-production overlays before any other processing: text, logos, symbols (©, ®, ™), signatures, stamps, brand badges, and semi-transparent watermarks. Pay extreme attention to text overlapping trees, foliage, or complex textures—do not leave ghosted outlines or semi-transparent traces behind. Completely reconstruct the native organic elements (leaves, branches, siding) behind the text. Inpaint seamlessly using matching textures and patterns. Zero traces or faded remnants allowed.\n\nTARGETED REMOVALS (ORDER OF OPERATIONS):\n\nWatermarks & Overlays: Erase all stamps, text boxes, promotional stickers, or borders.\n\nDebris & Trash: Remove all ground trash, loose leaves, random debris, surface litter, and noticeable lawn imperfections/patches. Replace with clean, matching ground/grass textures.\n\nPeople: Remove all human figures, faces, or bodies. Inpaint backgrounds seamlessly.\n\nSTRICT PRESERVATION DECREE:\nDo NOT alter, remove, or modify any in-scene physical furniture (sofas, specific pillows, tables, armchairs), decorative objects (rugs, plants, table lamps, chandeliers), or structural architecture (walls, windows, doors, balconies, stairs, and entire railing systems). Preserve all legitimate text physically printed inside the scene (on screens, signs, products).\n\nVISUAL & GEOMETRIC UPGRADES:\n\nPerspective: Subtle tripod-head camera rotation. Straighten vertical structures, walls, and door frames to be naturally parallel. Correct keystone distortion without changing focal lengths or chest-height perspective.\n\nLighting & Exposure: Lift underexposed midtones/shadows. Maximize brightness, clarity, and texture detail (wood grain, fabric weaves) without blowing out highlights or introducing noise.\n\nColor & Environment: Apply high-end architectural color correction and a touch of cinematic grading. Keep original indoor lighting balance. Conditional: If outdoor and overcast, replace with a clear, sunny sky casting sharp shadows.\n\nFinal Rendering: Output photorealistic, ultra-sharp 8K quality with micro-detail clarity, deep focus, and a high-end camera aesthetic.\n\nCRITICAL RESTRICTION: No non-photorealistic styles. Do not crush shadows or blur essential textures. Output must be 100% clean, pristine, and completely watermark-free.",
+      "clip": [
+        "75:71",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    }
+  },
+  "75:67": {
+    "inputs": {
+      "text": "",
+      "clip": [
+        "75:71",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Negative Prompt)"
+    }
+  },
+  "75:72": {
+    "inputs": {
+      "vae_name": "full_encoder_small_decoder.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "75:66": {
+    "inputs": {
+      "width": [
+        "75:100",
+        0
+      ],
+      "height": [
+        "75:100",
+        1
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptyFlux2LatentImage",
+    "_meta": {
+      "title": "Empty Flux 2 Latent"
+    }
+  },
+  "75:80": {
+    "inputs": {
+      "upscale_method": "nearest-exact",
+      "megapixels": 1,
+      "resolution_steps": 1,
+      "image": [
+        "76",
+        0
+      ]
+    },
+    "class_type": "ImageScaleToTotalPixels",
+    "_meta": {
+      "title": "Scale Image to Total Pixels"
+    }
+  },
+  "75:100": {
+    "inputs": {
+      "image": [
+        "75:80",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Image Size"
+    }
+  },
+  "75:122": {
+    "inputs": {
+      "conditioning": [
+        "75:67",
+        0
+      ],
+      "latent": [
+        "75:123",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "Set Reference Latent"
+    }
+  },
+  "75:123": {
+    "inputs": {
+      "pixels": [
+        "75:80",
+        0
+      ],
+      "vae": [
+        "75:72",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE Encode"
+    }
+  },
+  "75:124": {
+    "inputs": {
+      "conditioning": [
+        "75:74",
+        0
+      ],
+      "latent": [
+        "75:123",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "Set Reference Latent"
+    }
+  }
+}
