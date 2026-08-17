@@ -59,19 +59,19 @@ download_if_missing() {
 download_if_missing \
     "${MODEL_DIR}/diffusion_models" \
     "flux-2-klein-base-4b-fp8.safetensors" \
-    "https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors"
+    "https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4b-fp8/resolve/main/flux-2-klein-base-4b-fp8.safetensors"
 
 # 2. Text Encoder (CLIP/Qwen)
 download_if_missing \
     "${MODEL_DIR}/clip" \
     "qwen_3_4b.safetensors" \
-    "https://huggingface.co/Comfy-Org/Qwen2.5-3.4B-Instruct-GGUF/resolve/main/qwen2.5-3.4b-instruct-fp8.safetensors"
+    "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors"
 
 # 3. VAE
 download_if_missing \
     "${MODEL_DIR}/vae" \
     "full_encoder_small_decoder.safetensors" \
-    "https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors"
+    "https://huggingface.co/black-forest-labs/FLUX.2-small-decoder/resolve/main/full_encoder_small_decoder.safetensors"
 
 # Clean up stale locks & processes
 pkill -f "main.py" || true

@@ -29,17 +29,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
     && /opt/venv/bin/pip install --no-cache-dir \
-        torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+       torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
-# 3. Clone ComfyUI Core
+# 3. Clone ComfyUI Core and pin compatible comfy-kitchen
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /app/ComfyUI \
-    && /opt/venv/bin/pip install --no-cache-dir -r /app/ComfyUI/requirements.txt
+    && /opt/venv/bin/pip install --no-cache-dir -r /app/ComfyUI/requirements.txt \
+    && /opt/venv/bin/pip install --no-cache-dir "comfy-kitchen<=0.2.26"
 
-# 4. Install Node dependencies
+# 4. Create base fallback directories
+RUN mkdir -p /app/ComfyUI/models/diffusion_models \
+             /app/ComfyUI/models/clip \
+             /app/ComfyUI/models/vae \
+             /app/ComfyUI/input \
+             /app/ComfyUI/output
+
+# 5. Install Node dependencies
 COPY package*.json /app/
 RUN if [ -f /app/package.json ]; then npm install --omit=dev; fi
 
-# 5. Copy project files and workflow
+# 6. Copy project files and workflow
 COPY . /app/
 RUN chmod +x /app/entrypoint.sh
 
