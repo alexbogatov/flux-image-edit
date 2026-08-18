@@ -397,7 +397,13 @@ const process_job = async (job_data) => {
             if (prompt) {
                 workflow["75:74"].inputs.text = prompt;
             }
-            console.log(`[Job ${job_id}] Configured workflow graph (Noise Seed: ${seed})`);
+
+            // Force CFG to 1.0 for single-pass FLUX guidance (halves sampling iterations)
+            if (workflow["75:63"] && workflow["75:63"].inputs) {
+                workflow["75:63"].inputs.cfg = 1.0;
+            }
+
+            console.log(`[Job ${job_id}] Configured workflow graph (Noise Seed: ${seed}, CFG: 1.0)`);
 
             // Execute in ComfyUI
             const { output_path: generated_file, duration } = await execute_workflow(workflow, job_id);
