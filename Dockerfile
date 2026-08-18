@@ -13,13 +13,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /app
 
-# 1. System utilities, Python 3, Node.js 20, and build tools
+# 1. System utilities, Python 3, Node.js 20, GL libraries, and build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     wget \
     aria2 \
     ca-certificates \
+    libx11-6 \
+    libgl1 \
     python3 \
     python3-pip \
     python3-venv \
@@ -63,9 +65,13 @@ RUN mkdir -p /app/ComfyUI/models/diffusion_models \
              /app/ComfyUI/input \
              /app/ComfyUI/output
 
-# 6. Install Node dependencies
+# 6. Install Node dependencies (ensures AWS SDK & runtime packages exist)
 COPY package*.json /app/
-RUN if [ -f /app/package.json ]; then npm install --omit=dev; fi
+RUN if [ -f /app/package.json ]; then \
+      npm install --omit=dev && npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner dotenv ws; \
+    else \
+      npm init -y && npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner dotenv ws; \
+    fi
 
 # 7. Copy project files and workflow
 COPY . /app/
