@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+FROM nvidia/cuda:13.0.0-base-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -34,13 +34,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*
 
-# 2. Python virtual environment & PyTorch cu124 + comfy-kitchen stack
+# 2. Python virtual environment, PyTorch cu130, SageAttention & optimized kernels
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
     && /opt/venv/bin/pip install --no-cache-dir \
-       torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 \
+       torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 \
     && /opt/venv/bin/pip install --no-cache-dir \
-       comfy-kitchen alembic sqlalchemy
+       comfy-kitchen alembic sqlalchemy sageattention triton
 
 # 3. Clone ComfyUI Core and install requirements
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /app/ComfyUI \
@@ -65,7 +65,7 @@ RUN mkdir -p /app/ComfyUI/models/diffusion_models \
              /app/ComfyUI/input \
              /app/ComfyUI/output
 
-# 6. Install Node dependencies (ensures AWS SDK & runtime packages exist)
+# 6. Install Node dependencies
 COPY package*.json /app/
 RUN if [ -f /app/package.json ]; then \
       npm install --omit=dev && npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner dotenv ws; \
