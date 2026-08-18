@@ -5,6 +5,7 @@ echo "===================================================="
 echo "[Startup] Initializing Flux.2 Klein Image Worker"
 echo "===================================================="
 
+# Determine workspace root (RunPod persistent volume mount or fallback)
 PERSISTENT_DIR="${PERSISTENT_STORAGE_DIR:-/workspace}"
 MODEL_DIR="${PERSISTENT_DIR}/ComfyUI/models"
 
@@ -20,12 +21,13 @@ ln -sfn "${MODEL_DIR}" /app/ComfyUI/models
 ln -sfn "${PERSISTENT_DIR}/ComfyUI/input" /app/ComfyUI/input
 ln -sfn "${PERSISTENT_DIR}/ComfyUI/output" /app/ComfyUI/output
 
-# HuggingFace authorization
+# HuggingFace token authorization header
 AUTH_HEADER=""
 if [ -n "$HF_TOKEN" ]; then
     AUTH_HEADER="--header=Authorization: Bearer ${HF_TOKEN}"
 fi
 
+# Download helper function with DNS fallback
 download_if_missing() {
     local target_dir="$1"
     local file_name="$2"
@@ -35,6 +37,8 @@ download_if_missing() {
         echo "[Storage] Found '${file_name}' on persistent storage. Skipping download."
     else
         echo "[Storage] Missing '${file_name}'. Downloading via aria2..."
+        
+        # 1. Attempt with aria2c using OS system DNS resolver
         if ! aria2c -x 8 -s 8 -k 1M \
             --async-dns=false \
             --max-tries=5 \
@@ -43,6 +47,8 @@ download_if_missing() {
             -d "${target_dir}" -o "${file_name}" "${url}"; then
             
             echo "[Storage Warning] aria2c download failed. Falling back to wget..."
+            
+            # 2. Fallback to wget
             WGET_AUTH=$([ -n "$HF_TOKEN" ] && echo "--header=Authorization: Bearer ${HF_TOKEN}" || echo "")
             wget --quiet --show-progress -c $WGET_AUTH -O "${target_dir}/${file_name}" "${url}"
         fi
@@ -67,16 +73,18 @@ download_if_missing \
     "full_encoder_small_decoder.safetensors" \
     "https://huggingface.co/black-forest-labs/FLUX.2-small-decoder/resolve/main/full_encoder_small_decoder.safetensors"
 
+
 # Clean up stale locks & processes
 pkill -f "main.py" || true
 rm -f /app/ComfyUI/user/comfyui.db.lock || true
 
-# Launch ComfyUI with high-performance flags for 48GB L40
+# Launch ComfyUI with strict GPU residency
 /opt/venv/bin/python3 /app/ComfyUI/main.py \
     --listen 0.0.0.0 \
     --port 8188 \
     --gpu-only \
     --fast \
+    --use-sage-attention \
     --disable-auto-launch &
 
 echo "[Startup] Waiting for ComfyUI to bind to port 8188..."
