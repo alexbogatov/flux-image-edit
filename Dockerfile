@@ -31,10 +31,10 @@ RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir \
        torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
-# 3. Clone ComfyUI Core and install standard requirements
+# 3. Clone ComfyUI Core and install requirements + latest compatible comfy-kitchen
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /app/ComfyUI \
     && /opt/venv/bin/pip install --no-cache-dir -r /app/ComfyUI/requirements.txt \
-    && /opt/venv/bin/pip uninstall -y comfy-kitchen comfy_kitchen || true
+    && /opt/venv/bin/pip install --no-cache-dir --upgrade comfy-kitchen
 
 # 4. Create base fallback directories
 RUN mkdir -p /app/ComfyUI/models/diffusion_models \
