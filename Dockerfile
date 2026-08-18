@@ -25,16 +25,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*
 
-# 2. Python virtual environment & PyTorch 2.4+ cu124
+# 2. Python virtual environment & PyTorch cu124
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
     && /opt/venv/bin/pip install --no-cache-dir \
        torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
-# 3. Clone ComfyUI Core and pin compatible comfy-kitchen
+# 3. Clone ComfyUI Core and install standard requirements
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /app/ComfyUI \
     && /opt/venv/bin/pip install --no-cache-dir -r /app/ComfyUI/requirements.txt \
-    && /opt/venv/bin/pip install --no-cache-dir "comfy-kitchen<=0.2.26"
+    && /opt/venv/bin/pip uninstall -y comfy-kitchen comfy_kitchen || true
 
 # 4. Create base fallback directories
 RUN mkdir -p /app/ComfyUI/models/diffusion_models \
