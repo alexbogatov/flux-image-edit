@@ -13,28 +13,24 @@ const WORKFLOW_PATH = join(process.cwd(), 'flux.2.klein.json');
 const INPUT_DIR = join(process.cwd(), 'ComfyUI', 'input');
 const OUTPUT_DIR = join(process.cwd(), 'ComfyUI', 'output');
 
-// Identity: Use RunPod's built-in container POD ID if available, otherwise hostname
-const RUNPOD_POD_ID = process.env.RUNPOD_POD_ID;
-const MACHINE_ID = RUNPOD_POD_ID || os.hostname();
+// Identity strictly derived from the OS Hostname
+const MACHINE_ID = os.hostname();
+let WORKER_SECRET = null;
+let HYPERSTACK_VM_ID = null;
 
-// Central Backend Configuration (Hardcoded)
+// Hardcoded Backend Configuration
 const API_BASE_URL = 'https://api.runltx.com';
 const JOB_TYPE = 'generate';
 const MODEL_TYPE = 'image-edit';
 const POLL_INTERVAL_SECONDS = 3;
+const MAX_EMPTY_POLLS = 10;
 const MAX_RETRY_COUNT = 2;
-const MAX_EMPTY_POLLS = 10; // 10 polls * 3s = 30 seconds of inactivity before shutdown
 
-let WORKER_SECRET = null;
+// Hyperstack API Configuration
+const HYPERSTACK_API_URL = process.env.HYPERSTACK_API_URL || 'https://infrahub-api.nexgencloud.com/v1';
+const HYPERSTACK_API_KEY = process.env.HYPERSTACK_API_KEY;
 
-// ============================================
-// RunPod Configuration (Auto-Shutdown)
-// ============================================
-const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY;
-
-// ============================================
-// R2 Storage Client
-// ============================================
+// R2 Storage Client Configuration
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
@@ -60,48 +56,13 @@ const get_api_headers = () => ({
     'content-type': 'application/json'
 });
 
-const stop_runpod_instance = async () => {
-    if (!RUNPOD_API_KEY || !RUNPOD_POD_ID) {
-        console.warn('[Shutdown] RUNPOD_API_KEY or RUNPOD_POD_ID missing in environment. Cannot execute GraphQL podStop.');
-        return false;
-    }
-
-    try {
-        console.log(`[Shutdown] Inactivity threshold reached. Stopping RunPod '${RUNPOD_POD_ID}'...`);
-        
-        const query = `
-          mutation {
-            podStop(input: { podId: "${RUNPOD_POD_ID}" }) {
-              id
-              desiredStatus
-            }
-          }
-        `;
-
-        const res = await fetch('https://api.runpod.io/graphql', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${RUNPOD_API_KEY}`
-            },
-            body: JSON.stringify({ query })
-        });
-
-        const data = await res.json();
-        if (data.errors) {
-            throw new Error(`RunPod GraphQL error: ${JSON.stringify(data.errors)}`);
-        }
-
-        console.log('[Shutdown] Pod stop request successful:', data.data?.podStop);
-        return true;
-    } catch (err) {
-        console.error('[Shutdown Error]:', err.message);
-        return false;
-    }
-};
+const get_hyperstack_headers = () => ({
+    'api_key': HYPERSTACK_API_KEY,
+    'content-type': 'application/json'
+});
 
 // ============================================
-// Central Backend API Handshakes
+// Dynamic Registration & Cloud Discovery
 // ============================================
 const register_with_api = async () => {
     console.log(`[Worker Init] Registering '${MACHINE_ID}' for model '${MODEL_TYPE}'...`);
@@ -121,7 +82,7 @@ const register_with_api = async () => {
 
             if (res.ok && data.STATUS === 'OK' && data.SECRET) {
                 WORKER_SECRET = data.SECRET;
-                console.log(`[Worker Init] Worker authorized. Token established.`);
+                console.log(`[Worker Init] Host '${MACHINE_ID}' authorized. Secret token established.`);
                 return WORKER_SECRET;
             }
 
@@ -133,6 +94,73 @@ const register_with_api = async () => {
     }
 };
 
+const resolve_hyperstack_vm_id = async () => {
+    if (HYPERSTACK_VM_ID) return HYPERSTACK_VM_ID;
+    if (!HYPERSTACK_API_KEY) {
+        console.warn('[Hyperstack] HYPERSTACK_API_KEY missing. Skipping VM discovery.');
+        return null;
+    }
+
+    try {
+        console.log(`[Hyperstack] Querying VM ID for hostname '${MACHINE_ID}'...`);
+        const res = await fetch(`${HYPERSTACK_API_URL}/core/virtual-machines`, {
+            method: 'GET',
+            headers: get_hyperstack_headers()
+        });
+
+        if (!res.ok) {
+            const err_text = await res.text();
+            throw new Error(`HTTP ${res.status}: ${err_text}`);
+        }
+
+        const data = await res.json();
+        const instances = data.instances || [];
+        const match = instances.find((vm) => vm.name.toLowerCase() === MACHINE_ID.toLowerCase());
+
+        if (!match) {
+            console.warn(`[Hyperstack] VM '${MACHINE_ID}' not found in active instances list.`);
+            return null;
+        }
+
+        HYPERSTACK_VM_ID = match.id;
+        console.log(`[Hyperstack] Discovered VM ID: ${HYPERSTACK_VM_ID} (Name: ${match.name})`);
+        return HYPERSTACK_VM_ID;
+    } catch (err) {
+        console.error('[Hyperstack Discovery Error]:', err.message);
+        return null;
+    }
+};
+
+const hibernate_vm = async () => {
+    try {
+        const vm_id = await resolve_hyperstack_vm_id();
+        if (!vm_id) throw new Error('Cannot hibernate: Hyperstack VM ID is missing.');
+
+        console.log(`[Hibernate] Requesting hibernation for VM ${vm_id}...`);
+        
+        const url = `${HYPERSTACK_API_URL}/core/virtual-machines/${vm_id}/hibernate?retain_ip=true`;
+        const res = await fetch(url, {
+            method: 'GET',
+            headers: get_hyperstack_headers()
+        });
+
+        if (!res.ok) {
+            const err_text = await res.text();
+            throw new Error(`HTTP ${res.status}: ${err_text}`);
+        }
+
+        const data = await res.json();
+        console.log('[Hibernate] VM hibernation successfully initiated:', data);
+        return data;
+    } catch (err) {
+        console.error('[Hibernate Error]:', err.message);
+        return null;
+    }
+};
+
+// ============================================
+// Central Backend API Handshakes
+// ============================================
 const poll_for_job = async () => {
     try {
         const url = `${API_BASE_URL}/v1/worker/get?job_type=${JOB_TYPE}&model=${MODEL_TYPE}`;
@@ -327,9 +355,17 @@ const process_job = async (job_data) => {
 const worker_loop = async () => {
     console.log(`[Worker] Started on host: ${MACHINE_ID}`);
 
+    // 1. Handshake with API
     await register_with_api();
+
+    // 2. Discover Hyperstack VM ID
+    await resolve_hyperstack_vm_id();
+
+    // 3. Prepare Workspaces
     await mkdir(INPUT_DIR, { recursive: true });
     await mkdir(OUTPUT_DIR, { recursive: true });
+
+    // 4. Wait for ComfyUI
     await wait_for_comfy_ready();
 
     let empty_poll_count = 0;
@@ -344,8 +380,8 @@ const worker_loop = async () => {
                 console.log(`[Worker] No jobs available (${empty_poll_count}/${MAX_EMPTY_POLLS})`);
 
                 if (empty_poll_count >= MAX_EMPTY_POLLS) {
-                    console.log('[Worker] Idle threshold reached. Initiating RunPod shutdown...');
-                    await stop_runpod_instance();
+                    console.log('[Worker] Inactivity limit reached. Initiating VM hibernation...');
+                    await hibernate_vm();
                     process.exit(0);
                 }
 
@@ -353,7 +389,6 @@ const worker_loop = async () => {
                 continue;
             }
 
-            // Reset counter when a job is processed
             empty_poll_count = 0;
             await process_job(result.data);
             await sleep(1000);
