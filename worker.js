@@ -1,6 +1,6 @@
 import os from 'os';
-import { readFileSync, createReadStream } from 'fs';
-import { mkdir, writeFile, readdir, stat, unlink } from 'fs/promises';
+import { readFileSync, createReadStream, existsSync } from 'fs';
+import { mkdir, writeFile, stat, unlink } from 'fs/promises';
 import { join } from 'path';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 
@@ -10,15 +10,18 @@ import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 const COMFY_PORT = 8188;
 const COMFY_HOST = `http://127.0.0.1:${COMFY_PORT}`;
 const WORKFLOW_PATH = join(process.cwd(), 'flux.2.klein.json');
-const INPUT_DIR = join(process.cwd(), 'ComfyUI', 'input');
-const OUTPUT_DIR = join(process.cwd(), 'ComfyUI', 'output');
+
+// ComfyUI directory resolution (handles symlinked or local /workspace mounts)
+const BASE_COMFY_DIR = existsSync('/app/ComfyUI') ? '/app/ComfyUI' : join(process.cwd(), 'ComfyUI');
+const INPUT_DIR = join(BASE_COMFY_DIR, 'input');
+const OUTPUT_DIR = join(BASE_COMFY_DIR, 'output');
 
 // Identity strictly derived from the OS Hostname
 const MACHINE_ID = os.hostname();
 let WORKER_SECRET = null;
 let HYPERSTACK_VM_ID = null;
 
-// Hardcoded Backend Configuration
+// Backend Configuration
 const API_BASE_URL = 'https://api.runltx.com';
 const JOB_TYPE = 'generate';
 const MODEL_TYPE = 'image-edit';
@@ -36,6 +39,20 @@ const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
 const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME;
 const R2_CDN_URL = process.env.R2_CDN_URL;
+
+console.log('====================================================');
+console.log(`[Config] Machine ID:       ${MACHINE_ID}`);
+console.log(`[Config] API Endpoint:     ${API_BASE_URL}`);
+console.log(`[Config] Comfy Host:       ${COMFY_HOST}`);
+console.log(`[Config] Comfy Output Dir: ${OUTPUT_DIR}`);
+console.log(`[Config] R2 Account ID:    ${R2_ACCOUNT_ID ? 'Configured (' + R2_ACCOUNT_ID.slice(0, 6) + '...)' : 'MISSING'}`);
+console.log(`[Config] R2 Bucket:        ${R2_BUCKET_NAME || 'MISSING'}`);
+console.log(`[Config] R2 CDN URL:       ${R2_CDN_URL || 'MISSING'}`);
+console.log('====================================================');
+
+if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET_NAME) {
+    console.error('[CRITICAL] Missing required R2 environment variables. Uploads will fail!');
+}
 
 const s3_client = new S3Client({
     region: 'auto',
@@ -82,7 +99,7 @@ const register_with_api = async () => {
 
             if (res.ok && data.STATUS === 'OK' && data.SECRET) {
                 WORKER_SECRET = data.SECRET;
-                console.log(`[Worker Init] Host '${MACHINE_ID}' authorized. Secret token established.`);
+                console.log(`[Worker Init] Host '${MACHINE_ID}' authorized. Token established.`);
                 return WORKER_SECRET;
             }
 
@@ -137,7 +154,6 @@ const hibernate_vm = async () => {
         if (!vm_id) throw new Error('Cannot hibernate: Hyperstack VM ID is missing.');
 
         console.log(`[Hibernate] Requesting hibernation for VM ${vm_id}...`);
-        
         const url = `${HYPERSTACK_API_URL}/core/virtual-machines/${vm_id}/hibernate?retain_ip=true`;
         const res = await fetch(url, {
             method: 'GET',
@@ -150,7 +166,7 @@ const hibernate_vm = async () => {
         }
 
         const data = await res.json();
-        console.log('[Hibernate] VM hibernation successfully initiated:', data);
+        console.log('[Hibernate] VM hibernation successfully initiated:', JSON.stringify(data));
         return data;
     } catch (err) {
         console.error('[Hibernate Error]:', err.message);
@@ -180,16 +196,26 @@ const poll_for_job = async () => {
 };
 
 const complete_job = async (job_id, output_url, generation_time_sec) => {
+    console.log(`[API Handshake] Submitting completion for job '${job_id}'...`);
+    console.log(`[API Handshake] Output URL: ${output_url} | Time: ${generation_time_sec.toFixed(2)}s`);
+    
     const response = await fetch(`${API_BASE_URL}/v1/worker/complete`, {
         method: 'POST',
         headers: get_api_headers(),
         body: JSON.stringify({ job_id, output_url, generation_time_sec })
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
-    return await response.json();
+
+    if (!response.ok) {
+        const err_text = await response.text();
+        throw new Error(`API complete error: HTTP ${response.status} - ${err_text}`);
+    }
+    const result = await response.json();
+    console.log(`[API Handshake] Job '${job_id}' marked completed on server:`, JSON.stringify(result));
+    return result;
 };
 
 const fail_job = async (job_id, error_message) => {
+    console.log(`[API Handshake] Reporting failure for job '${job_id}': ${error_message}`);
     const response = await fetch(`${API_BASE_URL}/v1/worker/fail`, {
         method: 'POST',
         headers: get_api_headers(),
@@ -216,7 +242,8 @@ const wait_for_comfy_ready = async () => {
     }
 };
 
-const execute_workflow = async (workflow) => {
+const execute_workflow = async (workflow, job_id) => {
+    console.log(`[ComfyUI] Submitting prompt graph for job '${job_id}'...`);
     const response = await fetch(`${COMFY_HOST}/prompt`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -225,10 +252,11 @@ const execute_workflow = async (workflow) => {
 
     if (!response.ok) {
         const err_text = await response.text();
-        throw new Error(`ComfyUI prompt error: ${response.status} - ${err_text}`);
+        throw new Error(`ComfyUI prompt rejected: HTTP ${response.status} - ${err_text}`);
     }
 
     const { prompt_id } = await response.json();
+    console.log(`[ComfyUI] Job '${job_id}' accepted. Prompt ID: ${prompt_id}`);
     const start_time = Date.now();
 
     while (true) {
@@ -236,8 +264,33 @@ const execute_workflow = async (workflow) => {
         const history_res = await fetch(`${COMFY_HOST}/history/${prompt_id}`);
         if (history_res.ok) {
             const history_data = await history_res.json();
-            if (history_data[prompt_id]) {
-                return (Date.now() - start_time) / 1000;
+            const job_history = history_data[prompt_id];
+            
+            if (job_history) {
+                const duration = (Date.now() - start_time) / 1000;
+                
+                // 1. Check for engine errors
+                if (job_history.status?.status_str === 'error') {
+                    const messages = job_history.status.messages || [];
+                    throw new Error(`ComfyUI execution error: ${JSON.stringify(messages)}`);
+                }
+
+                // 2. Extract output files directly from SaveImage node output metadata
+                const outputs = job_history.outputs || {};
+                for (const nodeId in outputs) {
+                    const nodeOutput = outputs[nodeId];
+                    if (nodeOutput.images && nodeOutput.images.length > 0) {
+                        const img = nodeOutput.images[0];
+                        const subfolder = img.subfolder ? `${img.subfolder}/` : '';
+                        const output_path = join(OUTPUT_DIR, `${subfolder}${img.filename}`);
+                        
+                        console.log(`[ComfyUI] Execution successful in ${duration.toFixed(2)}s.`);
+                        console.log(`[ComfyUI] Resolved output path: ${output_path}`);
+                        return { output_path, duration };
+                    }
+                }
+
+                throw new Error(`ComfyUI finished prompt ${prompt_id} but output node produced no image references.`);
             }
         }
     }
@@ -246,57 +299,74 @@ const execute_workflow = async (workflow) => {
 // ============================================
 // Image IO & Storage
 // ============================================
-const find_latest_image = async (dir) => {
-    const files = [];
-    const walk = async (current_dir) => {
-        try {
-            const entries = await readdir(current_dir, { withFileTypes: true });
-            for (const entry of entries) {
-                const full_path = join(current_dir, entry.name);
-                if (entry.isDirectory()) {
-                    await walk(full_path);
-                } else if (/\.(png|jpg|jpeg|webp)$/i.test(entry.name)) {
-                    const stats = await stat(full_path);
-                    files.push({ path: full_path, mtime: stats.mtime });
-                }
-            }
-        } catch (_) {}
-    };
-
-    await walk(dir);
-    if (files.length === 0) return null;
-    files.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
-    return files[0].path;
-};
-
 const download_image = async (url, filename) => {
+    console.log(`[Input IO] Downloading input image: ${url}`);
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`Failed to download input image: ${res.statusText}`);
+    if (!res.ok) throw new Error(`Input download failed: HTTP ${res.status} (${res.statusText})`);
+    
     const buffer = await res.arrayBuffer();
     await mkdir(INPUT_DIR, { recursive: true });
     const image_path = join(INPUT_DIR, filename);
     await writeFile(image_path, Buffer.from(buffer));
+    
+    const stats = await stat(image_path);
+    console.log(`[Input IO] Input image saved to: ${image_path} (${(stats.size / 1024).toFixed(1)} KB)`);
     return image_path;
 };
 
 const upload_to_r2 = async (file_path, job_id) => {
-    const ext = file_path.endsWith('.png') ? 'png' : 'jpg';
+    if (!existsSync(file_path)) {
+        throw new Error(`File not found for R2 upload at path: ${file_path}`);
+    }
+
+    const file_stats = await stat(file_path);
+    const ext = file_path.endsWith('.png') ? 'png' : file_path.endsWith('.webp') ? 'webp' : 'jpg';
     const key = `edits/${job_id}.${ext}`;
+    const contentType = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
     const file_stream = createReadStream(file_path);
 
-    await s3_client.send(new PutObjectCommand({
+    console.log(`[R2 Upload] Starting upload for job '${job_id}'...`);
+    console.log(`[R2 Upload] Local File:  ${file_path} (${(file_stats.size / 1024).toFixed(1)} KB)`);
+    console.log(`[R2 Upload] Bucket:      ${R2_BUCKET_NAME}`);
+    console.log(`[R2 Upload] Key:         ${key}`);
+
+    const result = await s3_client.send(new PutObjectCommand({
         Bucket: R2_BUCKET_NAME,
         Key: key,
         Body: file_stream,
-        ContentType: ext === 'png' ? 'image/png' : 'image/jpeg',
+        ContentType: contentType,
     }));
 
-    return `${R2_CDN_URL}/${key}`;
+    const httpStatus = result.$metadata?.httpStatusCode;
+    console.log(`[R2 Upload] S3 PutObject finished with HTTP status: ${httpStatus}`);
+
+    if (httpStatus && httpStatus !== 200 && httpStatus !== 204) {
+        throw new Error(`R2 upload returned non-success HTTP status: ${httpStatus}`);
+    }
+
+    const public_url = `${R2_CDN_URL}/${key}`;
+    console.log(`[R2 Upload] Public CDN destination URL: ${public_url}`);
+    return public_url;
 };
 
 const cleanup_job_files = async (input_path, output_path) => {
-    if (input_path) try { await unlink(input_path); } catch (_) {}
-    if (output_path) try { await unlink(output_path); } catch (_) {}
+    console.log('[Cleanup] Removing temporary job artifacts from disk...');
+    if (input_path) {
+        try {
+            await unlink(input_path);
+            console.log(`[Cleanup] Deleted input:  ${input_path}`);
+        } catch (e) {
+            console.warn(`[Cleanup Warning] Could not remove input file: ${e.message}`);
+        }
+    }
+    if (output_path) {
+        try {
+            await unlink(output_path);
+            console.log(`[Cleanup] Deleted output: ${output_path}`);
+        } catch (e) {
+            console.warn(`[Cleanup Warning] Could not remove output file: ${e.message}`);
+        }
+    }
 };
 
 // ============================================
@@ -308,7 +378,10 @@ const process_job = async (job_data) => {
     let input_path = null;
     let output_path = null;
 
-    console.log(`[Job ${job_id}] Processing image edit job...`);
+    console.log(`\n====================================================`);
+    console.log(`[Job ${job_id}] Processing job request`);
+    console.log(`[Job ${job_id}] Prompt: "${prompt || ''}"`);
+    console.log(`====================================================`);
 
     while (retry_count < MAX_RETRY_COUNT) {
         try {
@@ -317,35 +390,42 @@ const process_job = async (job_data) => {
 
             const workflow = JSON.parse(readFileSync(WORKFLOW_PATH, 'utf-8'));
 
-            // Map workflow inputs
+            // Map workflow node inputs
             workflow["76"].inputs.image = input_filename;
-            workflow["75:73"].inputs.noise_seed = Math.floor(Math.random() * 1000000000000000);
+            const seed = Math.floor(Math.random() * 1000000000000000);
+            workflow["75:73"].inputs.noise_seed = seed;
             if (prompt) {
                 workflow["75:74"].inputs.text = prompt;
             }
+            console.log(`[Job ${job_id}] Configured workflow graph (Noise Seed: ${seed})`);
 
-            const generation_time = await execute_workflow(workflow);
-            output_path = await find_latest_image(OUTPUT_DIR);
+            // Execute in ComfyUI
+            const { output_path: generated_file, duration } = await execute_workflow(workflow, job_id);
+            output_path = generated_file;
 
-            if (!output_path) {
-                throw new Error('ComfyUI finished execution but output image was not found.');
-            }
-
+            // Upload directly to Cloudflare R2
             const r2_url = await upload_to_r2(output_path, job_id);
-            await complete_job(job_id, r2_url, generation_time);
+
+            // Handshake back to orchestrator
+            await complete_job(job_id, r2_url, duration);
+
+            // Cleanup local disks
             await cleanup_job_files(input_path, output_path);
 
-            console.log(`[Job ${job_id}] Finished successfully in ${generation_time.toFixed(2)}s`);
+            console.log(`[Job ${job_id}] Processing cycle complete in ${duration.toFixed(2)}s\n`);
             return true;
         } catch (err) {
             retry_count++;
-            console.error(`[Job ${job_id}] Attempt ${retry_count} failed: ${err.message}`);
+            console.error(`[Job ${job_id}] Attempt ${retry_count}/${MAX_RETRY_COUNT} failed with error:`);
+            console.error(err.stack || err.message);
 
             if (retry_count >= MAX_RETRY_COUNT) {
+                console.error(`[Job ${job_id}] Max retries reached. Reporting failure to server...`);
                 try { await fail_job(job_id, err.message); } catch (_) {}
                 await cleanup_job_files(input_path, output_path);
                 return false;
             }
+            console.log(`[Job ${job_id}] Waiting ${retry_count * 3}s before retry...`);
             await sleep(retry_count * 3000);
         }
     }
@@ -353,19 +433,19 @@ const process_job = async (job_data) => {
 };
 
 const worker_loop = async () => {
-    console.log(`[Worker] Started on host: ${MACHINE_ID}`);
+    console.log(`[Worker] Daemon started on machine: ${MACHINE_ID}`);
 
-    // 1. Handshake with API
+    // 1. Handshake with Central API
     await register_with_api();
 
-    // 2. Discover Hyperstack VM ID
+    // 2. Discover Hyperstack VM ID for Hibernate Control
     await resolve_hyperstack_vm_id();
 
-    // 3. Prepare Workspaces
+    // 3. Ensure Local Workspaces Exist
     await mkdir(INPUT_DIR, { recursive: true });
     await mkdir(OUTPUT_DIR, { recursive: true });
 
-    // 4. Wait for ComfyUI
+    // 4. Wait for ComfyUI to respond on port 8188
     await wait_for_comfy_ready();
 
     let empty_poll_count = 0;
@@ -377,10 +457,12 @@ const worker_loop = async () => {
 
             if (!result || !result.success || !result.data) {
                 empty_poll_count++;
-                console.log(`[Worker] No jobs available (${empty_poll_count}/${MAX_EMPTY_POLLS})`);
+                if (empty_poll_count % 5 === 0 || empty_poll_count === 1) {
+                    console.log(`[Worker] No jobs in queue (${empty_poll_count}/${MAX_EMPTY_POLLS})`);
+                }
 
                 if (empty_poll_count >= MAX_EMPTY_POLLS) {
-                    console.log('[Worker] Inactivity limit reached. Initiating VM hibernation...');
+                    console.log('[Worker] Inactivity threshold reached. Initiating VM hibernation...');
                     await hibernate_vm();
                     process.exit(0);
                 }
@@ -393,16 +475,23 @@ const worker_loop = async () => {
             await process_job(result.data);
             await sleep(1000);
         } catch (err) {
-            console.error('[Worker] Loop error:', err.message);
+            console.error('[Worker] Fatal error in main worker loop:', err.message);
             await sleep(POLL_INTERVAL_SECONDS * 1000);
         }
     }
 };
 
-process.on('SIGINT', () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => {
+    console.log('[Worker] SIGINT received. Shutting down...');
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    console.log('[Worker] SIGTERM received. Shutting down...');
+    process.exit(0);
+});
 
 worker_loop().catch((err) => {
-    console.error('[Worker] Fatal error:', err);
+    console.error('[Worker] Uncaught exception:', err);
     process.exit(1);
 });
