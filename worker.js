@@ -68,6 +68,13 @@ const s3_client = new S3Client({
 // ============================================
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const format_prompt_preview = (text, maxLength = 100) => {
+    if (!text) return '(empty)';
+    const singleLine = text.replace(/\s+/g, ' ').trim();
+    if (singleLine.length <= maxLength) return `"${singleLine}"`;
+    return `"${singleLine.slice(0, maxLength)}..." [${singleLine.length} chars]`;
+};
+
 const get_api_headers = () => ({
     'worker-auth': WORKER_SECRET,
     'content-type': 'application/json'
@@ -380,7 +387,7 @@ const process_job = async (job_data) => {
 
     console.log(`\n====================================================`);
     console.log(`[Job ${job_id}] Processing job request`);
-    console.log(`[Job ${job_id}] Prompt: "${prompt || ''}"`);
+    console.log(`[Job ${job_id}] Prompt: ${format_prompt_preview(prompt)}`);
     console.log(`====================================================`);
 
     while (retry_count < MAX_RETRY_COUNT) {
