@@ -9,8 +9,9 @@ import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 // ============================================
 const COMFY_PORT = 8188;
 const COMFY_HOST = `http://127.0.0.1:${COMFY_PORT}`;
-const WORKFLOW_PATH = join(process.cwd(), 'video_ltx2_5_i2v.json');
+const WORKFLOW_PATH = join(process.cwd(), 'flux.2.klein.json');
 
+// ComfyUI directory resolution (handles symlinked or local /workspace mounts)
 const BASE_COMFY_DIR = existsSync('/app/ComfyUI') ? '/app/ComfyUI' : join(process.cwd(), 'ComfyUI');
 const INPUT_DIR = join(BASE_COMFY_DIR, 'input');
 const OUTPUT_DIR = join(BASE_COMFY_DIR, 'output');
@@ -20,17 +21,19 @@ const MACHINE_ID = os.hostname();
 let WORKER_SECRET = null;
 let HYPERSTACK_VM_ID = null;
 
-// API Configuration
-const API_BASE_URL = process.env.API_BASE_URL || 'https://api.runltx.com';
-const POLL_INTERVAL_SECONDS = parseInt(process.env.POLL_INTERVAL_SECONDS) || 1;
+// Backend Configuration
+const API_BASE_URL = 'https://api.runltx.com';
+const JOB_TYPE = 'generate';
+const MODEL_TYPE = 'image-edit';
+const POLL_INTERVAL_SECONDS = 1;
 const MAX_EMPTY_POLLS = 3;
 const MAX_RETRY_COUNT = 2;
 
-// Hyperstack Configuration
+// Hyperstack API Configuration
 const HYPERSTACK_API_URL = process.env.HYPERSTACK_API_URL || 'https://infrahub-api.nexgencloud.com/v1';
 const HYPERSTACK_API_KEY = process.env.HYPERSTACK_API_KEY;
 
-// R2 Configuration
+// R2 Storage Client Configuration
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
 const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
@@ -86,32 +89,28 @@ const get_hyperstack_headers = () => ({
 // Dynamic Registration & Cloud Discovery
 // ============================================
 const register_with_api = async () => {
-    console.log(`[Worker Init] Registering hostname '${MACHINE_ID}' with central API...`);
+    console.log(`[Worker Init] Registering '${MACHINE_ID}' for model '${MODEL_TYPE}'...`);
 
     while (!WORKER_SECRET) {
         try {
             const res = await fetch(`${API_BASE_URL}/v1/worker/register`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ MACHINE_ID })
+                body: JSON.stringify({ 
+                    MACHINE_ID, 
+                    model_type: MODEL_TYPE 
+                })
             });
 
-            const text = await res.text();
-            let data;
-            try {
-                data = JSON.parse(text);
-            } catch (_) {
-                data = { raw: text };
-            }
+            const data = await res.json();
 
             if (res.ok && data.STATUS === 'OK' && data.SECRET) {
                 WORKER_SECRET = data.SECRET;
-                console.log(`[Worker Init] Host '${MACHINE_ID}' authorized. Secret token established.`);
+                console.log(`[Worker Init] Host '${MACHINE_ID}' authorized. Token established.`);
                 return WORKER_SECRET;
             }
 
-            console.error(`[Worker Init] Registration rejected (HTTP ${res.status}):`, JSON.stringify(data));
-            console.log('[Worker Init] Retrying in 5 seconds...');
+            console.error(`[Worker Init] Registration rejected:`, JSON.stringify(data));
         } catch (err) {
             console.error(`[Worker Init] Connection error: ${err.message}. Retrying in 5s...`);
         }
@@ -185,9 +184,9 @@ const hibernate_vm = async () => {
 // ============================================
 // Central Backend API Handshakes
 // ============================================
-const poll_for_job = async (job_type, model) => {
+const poll_for_job = async () => {
     try {
-        const url = `${API_BASE_URL}/v1/worker/get?job_type=${job_type}&model=${model}`;
+        const url = `${API_BASE_URL}/v1/worker/get?job_type=${JOB_TYPE}&model=${MODEL_TYPE}`;
         const response = await fetch(url, {
             method: 'GET',
             headers: get_api_headers()
@@ -206,7 +205,7 @@ const poll_for_job = async (job_type, model) => {
 const complete_job = async (job_id, output_url, generation_time_sec) => {
     console.log(`[API Handshake] Submitting completion for job '${job_id}'...`);
     console.log(`[API Handshake] Output URL: ${output_url} | Time: ${generation_time_sec.toFixed(2)}s`);
-
+    
     const response = await fetch(`${API_BASE_URL}/v1/worker/complete`, {
         method: 'POST',
         headers: get_api_headers(),
@@ -250,59 +249,6 @@ const wait_for_comfy_ready = async () => {
     }
 };
 
-const optimize_and_configure_workflow = (workflow, job_params) => {
-    const { image_filename, prompt_text, duration_sec, fps = 25 } = job_params;
-
-    for (const [node_id, node] of Object.entries(workflow)) {
-        if (!node || !node.inputs) continue;
-
-        // 1. Duration & FPS
-        if (node.class_type === 'PrimitiveInt') {
-            const title = node._meta?.title?.toLowerCase() || '';
-            if (title === 'duration' && duration_sec) {
-                node.inputs.value = Number(duration_sec);
-            } else if (title === 'frame rate' && fps) {
-                node.inputs.value = Number(fps);
-            }
-        }
-
-        // 2. Random Seeds
-        if (node.class_type === 'RandomNoise') {
-            node.inputs.noise_seed = Math.floor(Math.random() * 1000000000000000);
-        }
-
-        // 3. Load First Frame Image
-        if (node.class_type === 'LoadImage' && image_filename) {
-            node.inputs.image = image_filename;
-        }
-
-        // 4. Positive vs Negative Prompts
-        if (node.class_type === 'CLIPTextEncode') {
-            const title = node._meta?.title?.toLowerCase() || '';
-            if (title.includes('negative')) {
-                node.inputs.text = ''; // Zero-out negative prompt for distilled 1.0 CFG passes
-            } else if (prompt_text) {
-                node.inputs.text = prompt_text;
-            }
-        }
-
-        // Also check multiline prompt input primitive
-        if (node.class_type === 'PrimitiveStringMultiline' && prompt_text) {
-            node.inputs.value = prompt_text;
-        }
-
-        // 5. Optimize Tiled VAE for A100 (80GB VRAM allows tile_size 1024)
-        if (node.class_type === 'VAEDecodeTiled') {
-            node.inputs.tile_size = 1024;
-            node.inputs.overlap = 64;
-            node.inputs.temporal_size = 4096;
-            node.inputs.temporal_overlap = 32;
-        }
-    }
-
-    return workflow;
-};
-
 const execute_workflow = async (workflow, job_id) => {
     console.log(`[ComfyUI] Submitting prompt graph for job '${job_id}'...`);
     const response = await fetch(`${COMFY_HOST}/prompt`, {
@@ -321,58 +267,57 @@ const execute_workflow = async (workflow, job_id) => {
     const start_time = Date.now();
 
     while (true) {
-        await sleep(1500);
+        await sleep(1000);
         const history_res = await fetch(`${COMFY_HOST}/history/${prompt_id}`);
         if (history_res.ok) {
             const history_data = await history_res.json();
             const job_history = history_data[prompt_id];
-
+            
             if (job_history) {
                 const duration = (Date.now() - start_time) / 1000;
-
-                // Check for execution errors
+                
+                // 1. Check for engine errors
                 if (job_history.status?.status_str === 'error') {
                     const messages = job_history.status.messages || [];
                     throw new Error(`ComfyUI execution error: ${JSON.stringify(messages)}`);
                 }
 
-                // Extract output video directly from SaveVideo or CreateVideo outputs
+                // 2. Extract output files directly from SaveImage node output metadata
                 const outputs = job_history.outputs || {};
                 for (const nodeId in outputs) {
                     const nodeOutput = outputs[nodeId];
-                    const mediaList = nodeOutput.videos || nodeOutput.images || nodeOutput.gifs || [];
-                    if (mediaList.length > 0) {
-                        const media = mediaList[0];
-                        const subfolder = media.subfolder ? `${media.subfolder}/` : '';
-                        const output_path = join(OUTPUT_DIR, `${subfolder}${media.filename}`);
-
+                    if (nodeOutput.images && nodeOutput.images.length > 0) {
+                        const img = nodeOutput.images[0];
+                        const subfolder = img.subfolder ? `${img.subfolder}/` : '';
+                        const output_path = join(OUTPUT_DIR, `${subfolder}${img.filename}`);
+                        
                         console.log(`[ComfyUI] Execution successful in ${duration.toFixed(2)}s.`);
                         console.log(`[ComfyUI] Resolved output path: ${output_path}`);
                         return { output_path, duration };
                     }
                 }
 
-                throw new Error(`ComfyUI finished prompt ${prompt_id} but output node produced no video references.`);
+                throw new Error(`ComfyUI finished prompt ${prompt_id} but output node produced no image references.`);
             }
         }
     }
 };
 
 // ============================================
-// Image & Video IO
+// Image IO & Storage
 // ============================================
 const download_image = async (url, filename) => {
     console.log(`[Input IO] Downloading input image: ${url}`);
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Input download failed: HTTP ${res.status} (${res.statusText})`);
-
+    
     const buffer = await res.arrayBuffer();
     await mkdir(INPUT_DIR, { recursive: true });
     const image_path = join(INPUT_DIR, filename);
     await writeFile(image_path, Buffer.from(buffer));
-
+    
     const stats = await stat(image_path);
-    console.log(`[Input IO] Input image saved: ${image_path} (${(stats.size / 1024).toFixed(1)} KB)`);
+    console.log(`[Input IO] Input image saved to: ${image_path} (${(stats.size / 1024).toFixed(1)} KB)`);
     return image_path;
 };
 
@@ -382,11 +327,13 @@ const upload_to_r2 = async (file_path, job_id) => {
     }
 
     const file_stats = await stat(file_path);
-    const key = `generations/${job_id}.mp4`;
+    const ext = file_path.endsWith('.png') ? 'png' : file_path.endsWith('.webp') ? 'webp' : 'jpg';
+    const key = `edits/${job_id}.${ext}`;
+    const contentType = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
     const file_stream = createReadStream(file_path);
 
     console.log(`[R2 Upload] Starting upload for job '${job_id}'...`);
-    console.log(`[R2 Upload] Local File:  ${file_path} (${(file_stats.size / 1024 / 1024).toFixed(2)} MB)`);
+    console.log(`[R2 Upload] Local File:  ${file_path} (${(file_stats.size / 1024).toFixed(1)} KB)`);
     console.log(`[R2 Upload] Bucket:      ${R2_BUCKET_NAME}`);
     console.log(`[R2 Upload] Key:         ${key}`);
 
@@ -394,7 +341,7 @@ const upload_to_r2 = async (file_path, job_id) => {
         Bucket: R2_BUCKET_NAME,
         Key: key,
         Body: file_stream,
-        ContentType: 'video/mp4',
+        ContentType: contentType,
     }));
 
     const httpStatus = result.$metadata?.httpStatusCode;
@@ -433,13 +380,13 @@ const cleanup_job_files = async (input_path, output_path) => {
 // Main Job Processing Loop
 // ============================================
 const process_job = async (job_data) => {
-    const { job_id, image_url, duration_sec, prompt, job_type, model } = job_data;
+    const { job_id, image_url, prompt } = job_data;
     let retry_count = 0;
     let input_path = null;
     let output_path = null;
 
     console.log(`\n====================================================`);
-    console.log(`[Job ${job_id}] Processing (${job_type || 'generate'}/${model || 'ltx-i2v'}) - Duration: ${duration_sec || 2}s`);
+    console.log(`[Job ${job_id}] Processing job request`);
     console.log(`[Job ${job_id}] Prompt: ${format_prompt_preview(prompt)}`);
     console.log(`====================================================`);
 
@@ -448,30 +395,34 @@ const process_job = async (job_data) => {
             const input_filename = `${job_id}_input.jpg`;
             input_path = await download_image(image_url, input_filename);
 
-            const raw_workflow = readFileSync(WORKFLOW_PATH, 'utf-8');
-            let workflow = JSON.parse(raw_workflow);
+            const workflow = JSON.parse(readFileSync(WORKFLOW_PATH, 'utf-8'));
 
-            // Apply all dynamic modifications without touching the static JSON file
-            workflow = optimize_and_configure_workflow(workflow, {
-                image_filename: input_filename,
-                prompt_text: prompt,
-                duration_sec: duration_sec || 2,
-                fps: 25
-            });
+            // Map workflow node inputs
+            workflow["76"].inputs.image = input_filename;
+            const seed = Math.floor(Math.random() * 1000000000000000);
+            workflow["75:73"].inputs.noise_seed = seed;
+            if (prompt) {
+                workflow["75:74"].inputs.text = prompt;
+            }
 
-            console.log(`[Job ${job_id}] Configured workflow graph (VAE Tile Size: 1024, Negative: Empty)`);
+            // Force CFG to 1.0 for single-pass FLUX guidance (halves sampling iterations)
+            if (workflow["75:63"] && workflow["75:63"].inputs) {
+                workflow["75:63"].inputs.cfg = 1.0;
+            }
 
-            // Execute inside ComfyUI
+            console.log(`[Job ${job_id}] Configured workflow graph (Noise Seed: ${seed}, CFG: 1.0)`);
+
+            // Execute in ComfyUI
             const { output_path: generated_file, duration } = await execute_workflow(workflow, job_id);
             output_path = generated_file;
 
-            // Stream upload to Cloudflare R2
+            // Upload directly to Cloudflare R2
             const r2_url = await upload_to_r2(output_path, job_id);
 
-            // Handshake back to orchestrator API
+            // Handshake back to orchestrator
             await complete_job(job_id, r2_url, duration);
 
-            // Cleanup local artifacts
+            // Cleanup local disks
             await cleanup_job_files(input_path, output_path);
 
             console.log(`[Job ${job_id}] Processing cycle complete in ${duration.toFixed(2)}s\n`);
@@ -511,14 +462,11 @@ const worker_loop = async () => {
     await wait_for_comfy_ready();
 
     let empty_poll_count = 0;
-    const job_type = process.env.JOB_TYPE || 'generate';
-    const model = process.env.MODEL || 'ltx-i2v';
-
-    console.log(`[Worker] Polling for '${model}' jobs every ${POLL_INTERVAL_SECONDS}s...`);
+    console.log(`[Worker] Polling for '${MODEL_TYPE}' jobs every ${POLL_INTERVAL_SECONDS}s...`);
 
     while (true) {
         try {
-            const result = await poll_for_job(job_type, model);
+            const result = await poll_for_job();
 
             if (!result || !result.success || !result.data) {
                 empty_poll_count++;
