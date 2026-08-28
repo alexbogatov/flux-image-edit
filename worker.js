@@ -35,7 +35,6 @@ const JOB_TYPE = process.env.JOB_TYPE || 'generate';
 const MODEL_TYPE = process.env.MODEL_TYPE || 'image-edit';
 const POLL_INTERVAL_SECONDS = parseInt(process.env.POLL_INTERVAL_SECONDS, 10) || 1;
 const MAX_EMPTY_POLLS = parseInt(process.env.MAX_EMPTY_POLLS, 10) || 3;
-const MAX_RETRY_COUNT = parseInt(process.env.MAX_RETRY_COUNT, 10) || 2;
 
 // R2 Storage Client Configuration
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
@@ -74,7 +73,7 @@ const s3_client = new S3Client({
 // ============================================
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const format_prompt_preview = (text, maxLength = 100) => {
+const format_prompt_preview = (text, maxLength = 80) => {
   if (!text) return '(empty)';
   const singleLine = text.replace(/\s+/g, ' ').trim();
   if (singleLine.length <= maxLength) return `"${singleLine}"`;
@@ -200,31 +199,24 @@ const wait_for_comfy_ready = async () => {
         break;
       }
     } catch (_) {}
-    await sleep(500);
+    await sleep(250);
   }
 };
 
-// ============================================
-// Workflow Mutation
-// ============================================
 const mutate_workflow = (workflow, { input_filename, prompt }) => {
-  // Map input image node
   if (input_filename && workflow["76"]?.inputs) {
     workflow["76"].inputs.image = input_filename;
   }
 
-  // Randomize seed
   const seed = Math.floor(Math.random() * 1000000000000000);
   if (workflow["75:73"]?.inputs) {
     workflow["75:73"].inputs.noise_seed = seed;
   }
 
-  // Inject prompt text
   if (prompt && workflow["75:74"]?.inputs) {
     workflow["75:74"].inputs.text = prompt;
   }
 
-  // Force CFG to 1.0 for single-pass FLUX guidance
   if (workflow["75:63"]?.inputs) {
     workflow["75:63"].inputs.cfg = 1.0;
   }
@@ -233,7 +225,6 @@ const mutate_workflow = (workflow, { input_filename, prompt }) => {
 };
 
 const execute_workflow = async (workflow, job_id) => {
-  console.log(`[ComfyUI] Submitting prompt graph for job '${job_id}'...`);
   const response = await fetch(`${COMFY_HOST}/prompt`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -249,7 +240,7 @@ const execute_workflow = async (workflow, job_id) => {
   const start_time = Date.now();
 
   while (true) {
-    await sleep(500);
+    await sleep(250);
     const history_res = await fetch(`${COMFY_HOST}/history/${prompt_id}`);
     if (history_res.ok) {
       const history_data = await history_res.json();
@@ -314,14 +305,11 @@ const upload_to_r2 = async (file_path, job_id) => {
   return `${R2_CDN_URL}/${key}`;
 };
 
-// ============================================
-// Background Upload Task Runner
-// ============================================
 const upload_and_complete_async = async (job_id, isolated_path, input_paths = [], duration) => {
   try {
     const r2_url = await upload_to_r2(isolated_path, job_id);
     await complete_job(job_id, r2_url, duration);
-    console.log(`[Job ${job_id}] Background upload & complete finished successfully.`);
+    console.log(`[Job ${job_id}] Upload & complete resolved in background.`);
   } catch (err) {
     console.error(`[Job ${job_id}] Background upload/complete failed:`, err.message);
     try { await fail_job(job_id, err.message); } catch (_) {}
@@ -338,70 +326,59 @@ const upload_and_complete_async = async (job_id, isolated_path, input_paths = []
 };
 
 // ============================================
-// Main Job Processing
+// Pipeline Step: Prepare & Prefetch Job
 // ============================================
-const process_job = async (job_data) => {
+const prepare_job = async (job_data) => {
   const { job_id } = job_data;
   const input = job_data.input || {};
   const prompt = input.prompt || job_data.prompt || '';
   const images = Array.isArray(input.images) ? input.images : (job_data.image_url ? [job_data.image_url] : []);
 
-  let retry_count = 0;
+  let input_filename = null;
   const downloaded_paths = [];
 
-  console.log(`\n====================================================`);
-  console.log(`[Job ${job_id}] Processing job request`);
-  console.log(`[Job ${job_id}] Prompt: ${format_prompt_preview(prompt)}`);
-  console.log(`====================================================`);
-
-  while (retry_count < MAX_RETRY_COUNT) {
-    try {
-      let input_filename = null;
-      if (images.length > 0) {
-        input_filename = `${job_id}_input.jpg`;
-        const input_path = await download_image(images[0], input_filename);
-        downloaded_paths.push(input_path);
-      }
-
-      const raw_workflow = JSON.parse(readFileSync(WORKFLOW_PATH, 'utf-8'));
-      const workflow = mutate_workflow(raw_workflow, { input_filename, prompt });
-
-      // Execute in ComfyUI
-      const { output_path: generated_file, duration } = await execute_workflow(workflow, job_id);
-
-      // 1. Rename to isolate file immediately
-      const ext = generated_file.endsWith('.png') ? 'png' : generated_file.endsWith('.webp') ? 'webp' : 'jpg';
-      const isolated_path = join(OUTPUT_DIR, `uploading_${job_id}.${ext}`);
-      await rename(generated_file, isolated_path);
-
-      console.log(`[Job ${job_id}] Rendered in ${duration.toFixed(2)}s. Offloaded upload to background.`);
-
-      // 2. Fire and track background upload (GPU freed immediately)
-      const upload_task = upload_and_complete_async(job_id, isolated_path, downloaded_paths, duration);
-      active_uploads.add(upload_task);
-      upload_task.finally(() => active_uploads.delete(upload_task));
-
-      // 3. Immediately return so worker takes next job
-      return true;
-    } catch (err) {
-      retry_count++;
-      console.error(`[Job ${job_id}] Attempt ${retry_count}/${MAX_RETRY_COUNT} failed:`, err.message);
-
-      for (const path of downloaded_paths) {
-        try { await unlink(path); } catch (_) {}
-      }
-
-      if (retry_count >= MAX_RETRY_COUNT) {
-        try { await fail_job(job_id, err.message); } catch (_) {}
-        return false;
-      }
-
-      await sleep(retry_count * 2000);
-    }
+  if (images.length > 0) {
+    input_filename = `${job_id}_input.jpg`;
+    const input_path = await download_image(images[0], input_filename);
+    downloaded_paths.push(input_path);
   }
-  return false;
+
+  const raw_workflow = JSON.parse(readFileSync(WORKFLOW_PATH, 'utf-8'));
+  const workflow = mutate_workflow(raw_workflow, { input_filename, prompt });
+
+  return {
+    job_id,
+    workflow,
+    downloaded_paths,
+    prompt
+  };
 };
 
+const prefetch_next_job = async () => {
+  try {
+    const result = await poll_for_job();
+    if (!result || !result.success || !result.data) {
+      return null;
+    }
+
+    try {
+      const prepared = await prepare_job(result.data);
+      console.log(`[Prefetched Job ${prepared.job_id}] ${format_prompt_preview(prepared.prompt)}`);
+      return prepared;
+    } catch (prep_err) {
+      console.error(`[Job ${result.data.job_id}] Prep failed:`, prep_err.message);
+      try { await fail_job(result.data.job_id, prep_err.message); } catch (_) {}
+      return null;
+    }
+  } catch (err) {
+    console.error('[Pipeline] Prefetch error:', err.message);
+    return null;
+  }
+};
+
+// ============================================
+// Main Execution Loop
+// ============================================
 const worker_loop = async () => {
   console.log(`[Worker] Daemon started on machine: ${MACHINE_ID}`);
 
@@ -410,21 +387,32 @@ const worker_loop = async () => {
     process.exit(1);
   }
 
-  // 1. Ensure Local Workspaces Exist
   await mkdir(INPUT_DIR, { recursive: true });
   await mkdir(OUTPUT_DIR, { recursive: true });
+  await sync_stats_to_disk();
 
-  // 2. Wait for ComfyUI to respond on port 8188
   await wait_for_comfy_ready();
 
+  let current_job = null;
+  let prefetch_promise = null;
   let empty_poll_count = 0;
+
   console.log(`[Worker] Polling for '${MODEL_TYPE}' jobs every ${POLL_INTERVAL_SECONDS}s...`);
 
   while (true) {
     try {
-      const result = await poll_for_job();
+      // 1. Resolve prefetched job or poll immediately if no job in flight
+      if (prefetch_promise) {
+        current_job = await prefetch_promise;
+        prefetch_promise = null;
+      }
 
-      if (!result || !result.success || !result.data) {
+      if (!current_job) {
+        current_job = await prefetch_next_job();
+      }
+
+      // 2. Track empty polls and inactivity
+      if (!current_job) {
         empty_poll_count++;
         if (empty_poll_count % 5 === 0 || empty_poll_count === 1) {
           console.log(`[Worker] No jobs in queue (${empty_poll_count}/${MAX_EMPTY_POLLS})`);
@@ -439,10 +427,44 @@ const worker_loop = async () => {
       }
 
       empty_poll_count = 0;
-      await process_job(result.data);
+      console.log(`[GPU Render Job ${current_job.job_id}] ${format_prompt_preview(current_job.prompt)}`);
+
+      // 3. Immediately kick off prefetch for Job N+1 in parallel while GPU runs Job N
+      prefetch_promise = prefetch_next_job();
+
+      // 4. Render Job N
+      try {
+        const { output_path: generated_file, duration } = await execute_workflow(current_job.workflow, current_job.job_id);
+
+        const ext = generated_file.endsWith('.png') ? 'png' : generated_file.endsWith('.webp') ? 'webp' : 'jpg';
+        const isolated_path = join(OUTPUT_DIR, `uploading_${current_job.job_id}.${ext}`);
+        await rename(generated_file, isolated_path);
+
+        console.log(`[Job ${current_job.job_id}] Rendered in ${duration.toFixed(2)}s. Offloading background upload.`);
+
+        // 5. Fire background upload & continue immediately to Job N+1
+        const upload_task = upload_and_complete_async(
+          current_job.job_id,
+          isolated_path,
+          current_job.downloaded_paths,
+          duration
+        );
+        active_uploads.add(upload_task);
+        upload_task.finally(() => active_uploads.delete(upload_task));
+
+      } catch (render_err) {
+        console.error(`[Job ${current_job.job_id}] Render failed:`, render_err.message);
+        for (const path of current_job.downloaded_paths) {
+          try { await unlink(path); } catch (_) {}
+        }
+        try { await fail_job(current_job.job_id, render_err.message); } catch (_) {}
+      }
+
+      // Free current slot so next loop immediately processes the prefetched Job N+1
+      current_job = null;
 
     } catch (err) {
-      console.error('[Worker] Fatal error in main worker loop:', err.message);
+      console.error('[Worker] Error in main loop:', err.message);
       await sleep(POLL_INTERVAL_SECONDS * 1000);
     }
   }
@@ -459,6 +481,6 @@ process.on('SIGINT', handle_exit);
 process.on('SIGTERM', handle_exit);
 
 worker_loop().catch((err) => {
-  console.error('[Worker] Uncaught exception:', err);
+  console.error('[Worker] Fatal exception:', err);
   process.exit(1);
 });
