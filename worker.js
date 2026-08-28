@@ -1,6 +1,6 @@
 import os from 'os';
 import { readFileSync, createReadStream, existsSync } from 'fs';
-import { mkdir, writeFile, stat, unlink, rename } from 'fs/promises';
+import { mkdir, writeFile, unlink, rename } from 'fs/promises';
 import { join } from 'path';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 
@@ -16,15 +16,18 @@ const BASE_COMFY_DIR = existsSync('/app/ComfyUI') ? '/app/ComfyUI' : join(proces
 const INPUT_DIR = join(BASE_COMFY_DIR, 'input');
 const OUTPUT_DIR = join(BASE_COMFY_DIR, 'output');
 
-// Identity strictly derived from the OS Hostname & static secret
+// Identity & Session Tracking
 const MACHINE_ID = os.hostname();
 const WORKER_API_SECRET = process.env.WORKER_API_SECRET;
-
-// Discovery cache: null = unprobed, false = not a hyperstack instance, string/number = VM ID
-let HYPERSTACK_VM_ID = null;
+const WORKER_SESSION_ID = process.env.WORKER_SESSION_ID || null;
 
 // Track active background uploads to prevent shutdown race conditions
 const active_uploads = new Set();
+
+// Telemetry Stats for /v1/worker/off in entrypoint.sh
+const STATS_FILE = '/tmp/worker_stats.json';
+let jobs_processed = 0;
+let total_generation_time_sec = 0;
 
 // Backend Configuration
 const API_BASE_URL = process.env.API_BASE_URL || 'https://api.runltx.com';
@@ -33,10 +36,6 @@ const MODEL_TYPE = process.env.MODEL_TYPE || 'image-edit';
 const POLL_INTERVAL_SECONDS = parseInt(process.env.POLL_INTERVAL_SECONDS, 10) || 1;
 const MAX_EMPTY_POLLS = parseInt(process.env.MAX_EMPTY_POLLS, 10) || 3;
 const MAX_RETRY_COUNT = parseInt(process.env.MAX_RETRY_COUNT, 10) || 2;
-
-// Hyperstack API Configuration (Optional, for bare-metal/VM self-hibernation)
-const HYPERSTACK_API_URL = process.env.HYPERSTACK_API_URL || 'https://infrahub-api.nexgencloud.com/v1';
-const HYPERSTACK_API_KEY = process.env.HYPERSTACK_API_KEY;
 
 // R2 Storage Client Configuration
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
@@ -47,6 +46,7 @@ const R2_CDN_URL = process.env.R2_CDN_URL;
 
 console.log('====================================================');
 console.log(`[Config] Machine ID:        ${MACHINE_ID}`);
+console.log(`[Config] Session ID:        ${WORKER_SESSION_ID || 'NONE'}`);
 console.log(`[Config] API Endpoint:      ${API_BASE_URL}`);
 console.log(`[Config] Model Target:      ${JOB_TYPE}/${MODEL_TYPE}`);
 console.log(`[Config] Comfy Host:        ${COMFY_HOST}`);
@@ -81,91 +81,21 @@ const format_prompt_preview = (text, maxLength = 100) => {
   return `"${singleLine.slice(0, maxLength)}..." [${singleLine.length} chars]`;
 };
 
-const is_modal_runtime = () => {
-  return Boolean(
-    process.env.MODAL_TASK_ID ||
-    process.env.MODAL_IS_REMOTE ||
-    process.env.MODAL_ENVIRONMENT
-  );
-};
-
 const get_api_headers = () => ({
   'worker-auth': WORKER_API_SECRET,
   'x-machine-id': MACHINE_ID,
   'content-type': 'application/json'
 });
 
-const get_hyperstack_headers = () => ({
-  'api_key': HYPERSTACK_API_KEY,
-  'content-type': 'application/json'
-});
-
-// ============================================
-// Cloud Discovery & Teardown Handlers
-// ============================================
-const resolve_hyperstack_vm_id = async () => {
-  if (HYPERSTACK_VM_ID !== null) return HYPERSTACK_VM_ID;
-
-  if (is_modal_runtime() || !HYPERSTACK_API_KEY) {
-    HYPERSTACK_VM_ID = false;
-    return null;
-  }
-
+const sync_stats_to_disk = async () => {
   try {
-    console.log(`[Hyperstack] Checking if hostname '${MACHINE_ID}' exists in Hyperstack account...`);
-    const res = await fetch(`${HYPERSTACK_API_URL}/core/virtual-machines`, {
-      method: 'GET',
-      headers: get_hyperstack_headers()
+    const payload = JSON.stringify({
+      jobs_processed,
+      total_generation_time_sec: Math.round(total_generation_time_sec)
     });
-
-    if (!res.ok) {
-      HYPERSTACK_VM_ID = false;
-      return null;
-    }
-
-    const data = await res.json();
-    const instances = data.instances || [];
-    const match = instances.find((vm) => vm.name?.toLowerCase() === MACHINE_ID.toLowerCase());
-
-    if (!match) {
-      console.log(`[Platform Detection] Host '${MACHINE_ID}' not in Hyperstack inventory. Disabling Hyperstack hibernation.`);
-      HYPERSTACK_VM_ID = false;
-      return null;
-    }
-
-    HYPERSTACK_VM_ID = match.id;
-    console.log(`[Platform Detection] Hyperstack VM verified (ID: ${HYPERSTACK_VM_ID})`);
-    return HYPERSTACK_VM_ID;
+    await writeFile(STATS_FILE, payload);
   } catch (err) {
-    console.warn('[Hyperstack Discovery Failed]:', err.message);
-    HYPERSTACK_VM_ID = false;
-    return null;
-  }
-};
-
-const hibernate_vm = async () => {
-  try {
-    const vm_id = await resolve_hyperstack_vm_id();
-    if (!vm_id) throw new Error('Cannot hibernate: Hyperstack VM ID is missing.');
-
-    console.log(`[Hibernate] Requesting hibernation for VM ${vm_id}...`);
-    const url = `${HYPERSTACK_API_URL}/core/virtual-machines/${vm_id}/hibernate?retain_ip=true`;
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: get_hyperstack_headers()
-    });
-
-    if (!res.ok) {
-      const err_text = await res.text();
-      throw new Error(`HTTP ${res.status}: ${err_text}`);
-    }
-
-    const data = await res.json();
-    console.log('[Hibernate] VM hibernation successfully initiated:', JSON.stringify(data));
-    return data;
-  } catch (err) {
-    console.error('[Hibernate Error]:', err.message);
-    return null;
+    console.warn('[Stats] Failed to persist worker stats:', err.message);
   }
 };
 
@@ -178,22 +108,9 @@ const flush_pending_uploads = async () => {
 };
 
 const handle_inactivity_shutdown = async () => {
-  console.log('[Worker] Inactivity limit reached. Initiating teardown...');
+  console.log('[Worker] Inactivity limit reached. Finalizing worker process...');
   await flush_pending_uploads();
-
-  if (is_modal_runtime()) {
-    console.log('[Teardown: Modal] Serverless task finished. Exiting container.');
-    process.exit(0);
-  }
-
-  const vm_id = await resolve_hyperstack_vm_id();
-  if (vm_id) {
-    console.log(`[Teardown: Hyperstack] Hibernating Hyperstack VM ${vm_id}...`);
-    await hibernate_vm();
-    process.exit(0);
-  }
-
-  console.log('[Teardown: Generic] Exiting worker process.');
+  await sync_stats_to_disk();
   process.exit(0);
 };
 
@@ -202,10 +119,18 @@ const handle_inactivity_shutdown = async () => {
 // ============================================
 const poll_for_job = async () => {
   try {
-    const url = `${API_BASE_URL}/v1/worker/get?job_type=${JOB_TYPE}&model=${MODEL_TYPE}`;
+    const url = `${API_BASE_URL}/v1/worker/get`;
+    const payload = {
+      session_id: WORKER_SESSION_ID,
+      job_type: JOB_TYPE,
+      model: MODEL_TYPE,
+      models: MODEL_TYPE
+    };
+
     const response = await fetch(url, {
-      method: 'GET',
-      headers: get_api_headers()
+      method: 'POST',
+      headers: get_api_headers(),
+      body: JSON.stringify(payload)
     });
 
     if (response.status === 404) return null;
@@ -219,26 +144,45 @@ const poll_for_job = async () => {
 };
 
 const complete_job = async (job_id, output_url, generation_time_sec) => {
+  const payload = {
+    session_id: WORKER_SESSION_ID,
+    job_id,
+    output_url,
+    generation_time_sec
+  };
+
   const response = await fetch(`${API_BASE_URL}/v1/worker/complete`, {
     method: 'POST',
     headers: get_api_headers(),
-    body: JSON.stringify({ job_id, output_url, generation_time_sec })
+    body: JSON.stringify(payload)
   });
 
   if (!response.ok) {
     const err_text = await response.text();
     throw new Error(`API complete error: HTTP ${response.status} - ${err_text}`);
   }
+
+  jobs_processed += 1;
+  total_generation_time_sec += generation_time_sec;
+  await sync_stats_to_disk();
+
   return await response.json();
 };
 
 const fail_job = async (job_id, error_message) => {
   console.log(`[API Handshake] Reporting failure for job '${job_id}': ${error_message}`);
+  const payload = {
+    session_id: WORKER_SESSION_ID,
+    job_id,
+    error_message
+  };
+
   const response = await fetch(`${API_BASE_URL}/v1/worker/fail`, {
     method: 'POST',
     headers: get_api_headers(),
-    body: JSON.stringify({ job_id, error_message })
+    body: JSON.stringify(payload)
   });
+
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
   return await response.json();
 };
@@ -258,6 +202,34 @@ const wait_for_comfy_ready = async () => {
     } catch (_) {}
     await sleep(500);
   }
+};
+
+// ============================================
+// Workflow Mutation
+// ============================================
+const mutate_workflow = (workflow, { input_filename, prompt }) => {
+  // Map input image node
+  if (input_filename && workflow["76"]?.inputs) {
+    workflow["76"].inputs.image = input_filename;
+  }
+
+  // Randomize seed
+  const seed = Math.floor(Math.random() * 1000000000000000);
+  if (workflow["75:73"]?.inputs) {
+    workflow["75:73"].inputs.noise_seed = seed;
+  }
+
+  // Inject prompt text
+  if (prompt && workflow["75:74"]?.inputs) {
+    workflow["75:74"].inputs.text = prompt;
+  }
+
+  // Force CFG to 1.0 for single-pass FLUX guidance
+  if (workflow["75:63"]?.inputs) {
+    workflow["75:63"].inputs.cfg = 1.0;
+  }
+
+  return workflow;
 };
 
 const execute_workflow = async (workflow, job_id) => {
@@ -345,7 +317,7 @@ const upload_to_r2 = async (file_path, job_id) => {
 // ============================================
 // Background Upload Task Runner
 // ============================================
-const upload_and_complete_async = async (job_id, isolated_path, input_path, duration) => {
+const upload_and_complete_async = async (job_id, isolated_path, input_paths = [], duration) => {
   try {
     const r2_url = await upload_to_r2(isolated_path, job_id);
     await complete_job(job_id, r2_url, duration);
@@ -357,8 +329,10 @@ const upload_and_complete_async = async (job_id, isolated_path, input_path, dura
     if (isolated_path) {
       try { await unlink(isolated_path); } catch (_) {}
     }
-    if (input_path) {
-      try { await unlink(input_path); } catch (_) {}
+    for (const path of input_paths) {
+      if (path) {
+        try { await unlink(path); } catch (_) {}
+      }
     }
   }
 };
@@ -367,9 +341,13 @@ const upload_and_complete_async = async (job_id, isolated_path, input_path, dura
 // Main Job Processing
 // ============================================
 const process_job = async (job_data) => {
-  const { job_id, image_url, prompt } = job_data;
+  const { job_id } = job_data;
+  const input = job_data.input || {};
+  const prompt = input.prompt || job_data.prompt || '';
+  const images = Array.isArray(input.images) ? input.images : (job_data.image_url ? [job_data.image_url] : []);
+
   let retry_count = 0;
-  let input_path = null;
+  const downloaded_paths = [];
 
   console.log(`\n====================================================`);
   console.log(`[Job ${job_id}] Processing job request`);
@@ -378,23 +356,15 @@ const process_job = async (job_data) => {
 
   while (retry_count < MAX_RETRY_COUNT) {
     try {
-      const input_filename = `${job_id}_input.jpg`;
-      input_path = await download_image(image_url, input_filename);
-
-      const workflow = JSON.parse(readFileSync(WORKFLOW_PATH, 'utf-8'));
-
-      // Map workflow node inputs
-      workflow["76"].inputs.image = input_filename;
-      const seed = Math.floor(Math.random() * 1000000000000000);
-      workflow["75:73"].inputs.noise_seed = seed;
-      if (prompt) {
-        workflow["75:74"].inputs.text = prompt;
+      let input_filename = null;
+      if (images.length > 0) {
+        input_filename = `${job_id}_input.jpg`;
+        const input_path = await download_image(images[0], input_filename);
+        downloaded_paths.push(input_path);
       }
 
-      // Force CFG to 1.0 for single-pass FLUX guidance
-      if (workflow["75:63"] && workflow["75:63"].inputs) {
-        workflow["75:63"].inputs.cfg = 1.0;
-      }
+      const raw_workflow = JSON.parse(readFileSync(WORKFLOW_PATH, 'utf-8'));
+      const workflow = mutate_workflow(raw_workflow, { input_filename, prompt });
 
       // Execute in ComfyUI
       const { output_path: generated_file, duration } = await execute_workflow(workflow, job_id);
@@ -407,7 +377,7 @@ const process_job = async (job_data) => {
       console.log(`[Job ${job_id}] Rendered in ${duration.toFixed(2)}s. Offloaded upload to background.`);
 
       // 2. Fire and track background upload (GPU freed immediately)
-      const upload_task = upload_and_complete_async(job_id, isolated_path, input_path, duration);
+      const upload_task = upload_and_complete_async(job_id, isolated_path, downloaded_paths, duration);
       active_uploads.add(upload_task);
       upload_task.finally(() => active_uploads.delete(upload_task));
 
@@ -417,11 +387,12 @@ const process_job = async (job_data) => {
       retry_count++;
       console.error(`[Job ${job_id}] Attempt ${retry_count}/${MAX_RETRY_COUNT} failed:`, err.message);
 
+      for (const path of downloaded_paths) {
+        try { await unlink(path); } catch (_) {}
+      }
+
       if (retry_count >= MAX_RETRY_COUNT) {
         try { await fail_job(job_id, err.message); } catch (_) {}
-        if (input_path) {
-          try { await unlink(input_path); } catch (_) {}
-        }
         return false;
       }
 
@@ -469,7 +440,6 @@ const worker_loop = async () => {
 
       empty_poll_count = 0;
       await process_job(result.data);
-      // Zero sleep on success path: loops immediately to poll next job
 
     } catch (err) {
       console.error('[Worker] Fatal error in main worker loop:', err.message);
@@ -481,6 +451,7 @@ const worker_loop = async () => {
 const handle_exit = async () => {
   console.log('[Worker] Termination signal received.');
   await flush_pending_uploads();
+  await sync_stats_to_disk();
   process.exit(0);
 };
 
