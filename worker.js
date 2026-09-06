@@ -218,7 +218,7 @@ const mutate_workflow = (workflow, { input_filename, prompt }) => {
   }
 
   if (workflow["75:63"]?.inputs) {
-    workflow["75:63"].inputs.cfg = 1.0;
+    workflow["75:63"].inputs.cfg = 4.0;
   }
 
   return workflow;
