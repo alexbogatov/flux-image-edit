@@ -203,7 +203,7 @@ const wait_for_comfy_ready = async () => {
   }
 };
 
-const mutate_workflow = (workflow, { input_filename, prompt }) => {
+const mutate_workflow = (workflow, { input_filename, prompt, cfg = 4.0 }) => {
   if (input_filename && workflow["76"]?.inputs) {
     workflow["76"].inputs.image = input_filename;
   }
@@ -218,7 +218,9 @@ const mutate_workflow = (workflow, { input_filename, prompt }) => {
   }
 
   if (workflow["75:63"]?.inputs) {
-    workflow["75:63"].inputs.cfg = 4.0;
+    // Coerce to float if passed as a string or number, otherwise fallback to 4.0
+    const parsedCfg = parseFloat(cfg);
+    workflow["75:63"].inputs.cfg = !Number.isNaN(parsedCfg) ? parsedCfg : 4.0;
   }
 
   return workflow;
@@ -332,6 +334,7 @@ const prepare_job = async (job_data) => {
   const { job_id } = job_data;
   const input = job_data.input || {};
   const prompt = input.prompt || job_data.prompt || '';
+  const cfg = input.cfg ?? job_data.cfg ?? 4.0; // Extracts cfg if provided
   const images = Array.isArray(input.images) ? input.images : (job_data.image_url ? [job_data.image_url] : []);
 
   let input_filename = null;
@@ -344,13 +347,14 @@ const prepare_job = async (job_data) => {
   }
 
   const raw_workflow = JSON.parse(readFileSync(WORKFLOW_PATH, 'utf-8'));
-  const workflow = mutate_workflow(raw_workflow, { input_filename, prompt });
+  const workflow = mutate_workflow(raw_workflow, { input_filename, prompt, cfg });
 
   return {
     job_id,
     workflow,
     downloaded_paths,
-    prompt
+    prompt,
+    cfg
   };
 };
 
