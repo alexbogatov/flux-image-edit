@@ -48,24 +48,25 @@ RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /app/Comfy
     && rm -rf /root/.cache /tmp/*
 
 # 4. Patch comfy_kitchen na.py and sol_attn.py directly inside the venv for Python 3.10 compatibility
-RUN /opt/venv/bin/python3 -c "\
-import importlib.util, os;\
-spec = importlib.util.find_spec('comfy_kitchen');\
-base_dir = spec.submodule_search_locations[0];\
-\
-files_to_patch = [\
-    os.path.join(base_dir, 'backends', 'eager', 'na.py'),\
-    os.path.join(base_dir, 'backends', 'eager', 'sol_attn.py')\
-];\
-\
-for path in files_to_patch:\
-    if os.path.exists(path):\
-        code = open(path).read();\
-        code = code.replace('from typing import', 'from typing import Sequence, Optional, List,') if 'from typing import' in code else 'from typing import Sequence, Optional, List\n' + code;\
-        code = code.replace('list[int]', 'Sequence[int]').replace('list[bool]', 'Sequence[bool]').replace('float | None', 'Optional[float]');\
-        open(path, 'w').write(code);\
-        print(f'[Build] Patched {os.path.basename(path)} successfully');\
-"
+RUN /opt/venv/bin/python3 -c "exec('''\n\
+import importlib.util, os\n\
+spec = importlib.util.find_spec(\"comfy_kitchen\")\n\
+base_dir = spec.submodule_search_locations[0]\n\
+files_to_patch = [\n\
+    os.path.join(base_dir, \"backends\", \"eager\", \"na.py\"),\n\
+    os.path.join(base_dir, \"backends\", \"eager\", \"sol_attn.py\")\n\
+]\n\
+for path in files_to_patch:\n\
+    if os.path.exists(path):\n\
+        code = open(path).read()\n\
+        if \"from typing import\" in code:\n\
+            code = code.replace(\"from typing import\", \"from typing import Sequence, Optional, List,\")\n\
+        else:\n\
+            code = \"from typing import Sequence, Optional, List\" + chr(10) + code\n\
+        code = code.replace(\"list[int]\", \"Sequence[int]\").replace(\"list[bool]\", \"Sequence[bool]\").replace(\"float | None\", \"Optional[float]\")\n\
+        open(path, \"w\").write(code)\n\
+        print(f\"[Build] Patched {os.path.basename(path)} successfully\")\n\
+''')"
 
 
 # 5. Create base fallback directories
