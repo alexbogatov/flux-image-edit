@@ -339,6 +339,10 @@ const prepare_job = async (job_data) => {
   const { job_id } = job_data;
   const input = job_data.input || {};
   const prompt = input.prompt || job_data.prompt || '';
+  
+  // Extract cfg from the payload (checking both input and root)
+  const cfg = input.cfg || job_data.cfg; 
+  
   const images = Array.isArray(input.images) ? input.images : (job_data.image_url ? [job_data.image_url] : []);
 
   let input_filename = null;
@@ -351,7 +355,9 @@ const prepare_job = async (job_data) => {
   }
 
   const raw_workflow = JSON.parse(readFileSync(WORKFLOW_PATH, 'utf-8'));
-  const workflow = mutate_workflow(raw_workflow, { input_filename, prompt });
+  
+  // Pass cfg into the mutate function
+  const workflow = mutate_workflow(raw_workflow, { input_filename, prompt, cfg }); 
 
   return {
     job_id,
