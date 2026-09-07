@@ -34,11 +34,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*
 
-# 2. Python virtual environment, PyTorch cu130, SageAttention & optimized kernels
+# 2. Python virtual environment, PyTorch cu124 for L40, SageAttention & optimized kernels
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
     && /opt/venv/bin/pip install --no-cache-dir \
-       torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130 \
+       torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 \
     && /opt/venv/bin/pip install --no-cache-dir \
        comfy-kitchen alembic sqlalchemy sageattention triton
 
