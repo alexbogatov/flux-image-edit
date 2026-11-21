@@ -7,25 +7,27 @@ import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 // ============================================
 // CONSTANTS & IDENTITY
 // ============================================
-const COMFY_PORT = 8188;
+const WORKER_SUFFIX = process.env.WORKER_SUFFIX || 'worker_1';
+const COMFY_PORT = parseInt(process.env.COMFY_PORT, 10) || 8188;
 const COMFY_HOST = `http://127.0.0.1:${COMFY_PORT}`;
 const WORKFLOW_PATH = join(process.cwd(), 'flux.2.klein.json');
 
-// ComfyUI directory resolution (handles symlinked or local /workspace mounts)
+// ComfyUI directory resolution
 const BASE_COMFY_DIR = existsSync('/app/ComfyUI') ? '/app/ComfyUI' : join(process.cwd(), 'ComfyUI');
 const INPUT_DIR = join(BASE_COMFY_DIR, 'input');
 const OUTPUT_DIR = join(BASE_COMFY_DIR, 'output');
 
 // Identity & Session Tracking
 const MACHINE_ID = os.hostname();
+const UNIQUE_WORKER_ID = `${MACHINE_ID}-${WORKER_SUFFIX}`;
 const WORKER_API_SECRET = process.env.WORKER_API_SECRET;
 const WORKER_SESSION_ID = process.env.WORKER_SESSION_ID || null;
 
 // Track active background uploads to prevent shutdown race conditions
 const active_uploads = new Set();
 
-// Telemetry Stats for /v1/worker/off in entrypoint.sh
-const STATS_FILE = '/tmp/worker_stats.json';
+// Telemetry Stats (isolated per worker suffix)
+const STATS_FILE = `/tmp/worker_stats_${WORKER_SUFFIX}.json`;
 let jobs_processed = 0;
 let total_generation_time_sec = 0;
 
@@ -44,19 +46,16 @@ const R2_BUCKET_NAME = process.env.R2_BUCKET_NAME;
 const R2_CDN_URL = process.env.R2_CDN_URL;
 
 console.log('====================================================');
-console.log(`[Config] Machine ID:        ${MACHINE_ID}`);
+console.log(`[Config] Worker ID:         ${UNIQUE_WORKER_ID}`);
 console.log(`[Config] Session ID:        ${WORKER_SESSION_ID || 'NONE'}`);
-console.log(`[Config] API Endpoint:      ${API_BASE_URL}`);
-console.log(`[Config] Model Target:      ${JOB_TYPE}/${MODEL_TYPE}`);
+console.log(`[Config] Comfy Port:        ${COMFY_PORT}`);
 console.log(`[Config] Comfy Host:        ${COMFY_HOST}`);
-console.log(`[Config] Comfy Output Dir:  ${OUTPUT_DIR}`);
-console.log(`[Config] R2 Account ID:     ${R2_ACCOUNT_ID ? 'Configured (' + R2_ACCOUNT_ID.slice(0, 6) + '...)' : 'MISSING'}`);
-console.log(`[Config] R2 Bucket:         ${R2_BUCKET_NAME || 'MISSING'}`);
-console.log(`[Config] R2 CDN URL:        ${R2_CDN_URL || 'MISSING'}`);
+console.log(`[Config] Stats Target:      ${STATS_FILE}`);
+console.log(`[Config] Model Target:      ${JOB_TYPE}/${MODEL_TYPE}`);
 console.log('====================================================');
 
 if (!R2_ACCOUNT_ID || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET_NAME) {
-  console.error('[CRITICAL] Missing required R2 environment variables. Uploads will fail!');
+  console.error(`[${WORKER_SUFFIX}] [CRITICAL] Missing required R2 environment variables. Uploads will fail!`);
 }
 
 const s3_client = new S3Client({
@@ -83,31 +82,33 @@ const format_prompt_preview = (text, maxLength = 80) => {
 const get_api_headers = () => ({
   'worker-auth': WORKER_API_SECRET,
   'x-machine-id': MACHINE_ID,
+  'x-worker-id': UNIQUE_WORKER_ID,
   'content-type': 'application/json'
 });
 
 const sync_stats_to_disk = async () => {
   try {
     const payload = JSON.stringify({
+      worker: UNIQUE_WORKER_ID,
       jobs_processed,
       total_generation_time_sec: Math.round(total_generation_time_sec)
     });
     await writeFile(STATS_FILE, payload);
   } catch (err) {
-    console.warn('[Stats] Failed to persist worker stats:', err.message);
+    console.warn(`[${WORKER_SUFFIX}] Failed to persist stats:`, err.message);
   }
 };
 
 const flush_pending_uploads = async () => {
   if (active_uploads.size > 0) {
-    console.log(`[Worker] Waiting for ${active_uploads.size} background upload(s) to complete before teardown...`);
+    console.log(`[${WORKER_SUFFIX}] Waiting for ${active_uploads.size} background upload(s) before teardown...`);
     await Promise.allSettled(Array.from(active_uploads));
-    console.log('[Worker] All background uploads resolved.');
+    console.log(`[${WORKER_SUFFIX}] All background uploads resolved.`);
   }
 };
 
 const handle_inactivity_shutdown = async () => {
-  console.log('[Worker] Inactivity limit reached. Finalizing worker process...');
+  console.log(`[${WORKER_SUFFIX}] Inactivity limit reached. Finalizing...`);
   await flush_pending_uploads();
   await sync_stats_to_disk();
   process.exit(0);
@@ -121,6 +122,8 @@ const poll_for_job = async () => {
     const url = `${API_BASE_URL}/v1/worker/get`;
     const payload = {
       session_id: WORKER_SESSION_ID,
+      worker_id: UNIQUE_WORKER_ID,
+      slot: WORKER_SUFFIX,
       job_type: JOB_TYPE,
       model: MODEL_TYPE,
       models: MODEL_TYPE
@@ -137,7 +140,7 @@ const poll_for_job = async () => {
 
     return await response.json();
   } catch (err) {
-    console.error('[API Poll Error]:', err.message);
+    console.error(`[${WORKER_SUFFIX}] [API Poll Error]:`, err.message);
     return null;
   }
 };
@@ -145,6 +148,7 @@ const poll_for_job = async () => {
 const complete_job = async (job_id, output_url, generation_time_sec) => {
   const payload = {
     session_id: WORKER_SESSION_ID,
+    worker_id: UNIQUE_WORKER_ID,
     job_id,
     output_url,
     generation_time_sec
@@ -169,9 +173,10 @@ const complete_job = async (job_id, output_url, generation_time_sec) => {
 };
 
 const fail_job = async (job_id, error_message) => {
-  console.log(`[API Handshake] Reporting failure for job '${job_id}': ${error_message}`);
+  console.log(`[${WORKER_SUFFIX}] Reporting failure for job '${job_id}': ${error_message}`);
   const payload = {
     session_id: WORKER_SESSION_ID,
+    worker_id: UNIQUE_WORKER_ID,
     job_id,
     error_message
   };
@@ -190,12 +195,12 @@ const fail_job = async (job_id, error_message) => {
 // ComfyUI Engine Interface
 // ============================================
 const wait_for_comfy_ready = async () => {
-  console.log('[ComfyUI] Probing server readiness on port 8188...');
+  console.log(`[${WORKER_SUFFIX}] Probing ComfyUI on port ${COMFY_PORT}...`);
   while (true) {
     try {
       const res = await fetch(`${COMFY_HOST}/history`);
       if (res.ok) {
-        console.log('[ComfyUI] Server online and responsive.');
+        console.log(`[${WORKER_SUFFIX}] ComfyUI online on port ${COMFY_PORT}.`);
         break;
       }
     } catch (_) {}
@@ -218,14 +223,17 @@ const mutate_workflow = (workflow, { input_filename, prompt, cfg = 4.0 }) => {
   }
 
   if (workflow["75:63"]?.inputs) {
-    // Coerce to float if passed as a string or number, otherwise fallback to 4.0
     const parsedCfg = parseFloat(cfg);
-
     const setting_cfg = !Number.isNaN(parsedCfg) ? parsedCfg : 4.0;
-
-    console.log(`Setting CFG to: ${setting_cfg}`)
-
     workflow["75:63"].inputs.cfg = setting_cfg;
+  }
+
+  // Ensure SaveImage prefixes use this worker's suffix to prevent write collisions
+  for (const nodeId in workflow) {
+    if (workflow[nodeId].class_type === 'SaveImage') {
+      const existingPrefix = workflow[nodeId].inputs?.filename_prefix || 'ComfyUI';
+      workflow[nodeId].inputs.filename_prefix = `${WORKER_SUFFIX}_${existingPrefix}`;
+    }
   }
 
   return workflow;
@@ -272,7 +280,7 @@ const execute_workflow = async (workflow, job_id) => {
           }
         }
 
-        throw new Error(`ComfyUI finished prompt ${prompt_id} but output node produced no image references.`);
+        throw new Error(`ComfyUI finished prompt ${prompt_id} but produced no output images.`);
       }
     }
   }
@@ -294,7 +302,7 @@ const download_image = async (url, filename) => {
 
 const upload_to_r2 = async (file_path, job_id) => {
   if (!existsSync(file_path)) {
-    throw new Error(`File not found for R2 upload at path: ${file_path}`);
+    throw new Error(`File not found for R2 upload: ${file_path}`);
   }
 
   const ext = file_path.endsWith('.png') ? 'png' : file_path.endsWith('.webp') ? 'webp' : 'jpg';
@@ -316,9 +324,9 @@ const upload_and_complete_async = async (job_id, isolated_path, input_paths = []
   try {
     const r2_url = await upload_to_r2(isolated_path, job_id);
     await complete_job(job_id, r2_url, duration);
-    console.log(`[Job ${job_id}] Upload & complete resolved in background.`);
+    console.log(`[${WORKER_SUFFIX}] [Job ${job_id}] Upload & complete resolved in background.`);
   } catch (err) {
-    console.error(`[Job ${job_id}] Background upload/complete failed:`, err.message);
+    console.error(`[${WORKER_SUFFIX}] [Job ${job_id}] Background task failed:`, err.message);
     try { await fail_job(job_id, err.message); } catch (_) {}
   } finally {
     if (isolated_path) {
@@ -339,32 +347,22 @@ const prepare_job = async (job_data) => {
   const { job_id } = job_data;
   const input = job_data.input || {};
   const prompt = input.prompt || job_data.prompt || '';
-  
-  // Extract cfg from the payload (checking both input and root)
-  const cfg = input.cfg || job_data.cfg; 
-  
+  const cfg = input.cfg || job_data.cfg;
   const images = Array.isArray(input.images) ? input.images : (job_data.image_url ? [job_data.image_url] : []);
 
   let input_filename = null;
   const downloaded_paths = [];
 
   if (images.length > 0) {
-    input_filename = `${job_id}_input.jpg`;
+    input_filename = `${WORKER_SUFFIX}_${job_id}_input.jpg`;
     const input_path = await download_image(images[0], input_filename);
     downloaded_paths.push(input_path);
   }
 
   const raw_workflow = JSON.parse(readFileSync(WORKFLOW_PATH, 'utf-8'));
-  
-  // Pass cfg into the mutate function
-  const workflow = mutate_workflow(raw_workflow, { input_filename, prompt, cfg }); 
+  const workflow = mutate_workflow(raw_workflow, { input_filename, prompt, cfg });
 
-  return {
-    job_id,
-    workflow,
-    downloaded_paths,
-    prompt
-  };
+  return { job_id, workflow, downloaded_paths, prompt };
 };
 
 const prefetch_next_job = async () => {
@@ -376,15 +374,15 @@ const prefetch_next_job = async () => {
 
     try {
       const prepared = await prepare_job(result.data);
-      console.log(`[Prefetched Job ${prepared.job_id}] ${format_prompt_preview(prepared.prompt)}`);
+      console.log(`[${WORKER_SUFFIX}] [Prefetched Job ${prepared.job_id}] ${format_prompt_preview(prepared.prompt)}`);
       return prepared;
     } catch (prep_err) {
-      console.error(`[Job ${result.data.job_id}] Prep failed:`, prep_err.message);
+      console.error(`[${WORKER_SUFFIX}] [Job ${result.data.job_id}] Prep failed:`, prep_err.message);
       try { await fail_job(result.data.job_id, prep_err.message); } catch (_) {}
       return null;
     }
   } catch (err) {
-    console.error('[Pipeline] Prefetch error:', err.message);
+    console.error(`[${WORKER_SUFFIX}] [Pipeline] Prefetch error:`, err.message);
     return null;
   }
 };
@@ -393,28 +391,26 @@ const prefetch_next_job = async () => {
 // Main Execution Loop
 // ============================================
 const worker_loop = async () => {
-  console.log(`[Worker] Daemon started on machine: ${MACHINE_ID}`);
+  console.log(`[${WORKER_SUFFIX}] Daemon started on ${UNIQUE_WORKER_ID}`);
 
   if (!WORKER_API_SECRET) {
-    console.error('[Worker Fatal] WORKER_API_SECRET environment variable is missing.');
+    console.error(`[${WORKER_SUFFIX}] WORKER_API_SECRET missing.`);
     process.exit(1);
   }
 
   await mkdir(INPUT_DIR, { recursive: true });
   await mkdir(OUTPUT_DIR, { recursive: true });
   await sync_stats_to_disk();
-
   await wait_for_comfy_ready();
 
   let current_job = null;
   let prefetch_promise = null;
   let empty_poll_count = 0;
 
-  console.log(`[Worker] Polling for '${MODEL_TYPE}' jobs every ${POLL_INTERVAL_SECONDS}s...`);
+  console.log(`[${WORKER_SUFFIX}] Polling every ${POLL_INTERVAL_SECONDS}s...`);
 
   while (true) {
     try {
-      // 1. Resolve prefetched job or poll immediately if no job in flight
       if (prefetch_promise) {
         current_job = await prefetch_promise;
         prefetch_promise = null;
@@ -424,11 +420,10 @@ const worker_loop = async () => {
         current_job = await prefetch_next_job();
       }
 
-      // 2. Track empty polls and inactivity
       if (!current_job) {
         empty_poll_count++;
         if (empty_poll_count % 5 === 0 || empty_poll_count === 1) {
-          console.log(`[Worker] No jobs in queue (${empty_poll_count}/${MAX_EMPTY_POLLS})`);
+          console.log(`[${WORKER_SUFFIX}] Queue empty (${empty_poll_count}/${MAX_EMPTY_POLLS})`);
         }
 
         if (empty_poll_count >= MAX_EMPTY_POLLS) {
@@ -440,22 +435,20 @@ const worker_loop = async () => {
       }
 
       empty_poll_count = 0;
-      console.log(`[GPU Render Job ${current_job.job_id}] ${format_prompt_preview(current_job.prompt)}`);
+      console.log(`[${WORKER_SUFFIX}] [GPU Render Job ${current_job.job_id}] ${format_prompt_preview(current_job.prompt)}`);
 
-      // 3. Immediately kick off prefetch for Job N+1 in parallel while GPU runs Job N
+      // Prefetch Job N+1 in parallel while GPU generates Job N
       prefetch_promise = prefetch_next_job();
 
-      // 4. Render Job N
       try {
         const { output_path: generated_file, duration } = await execute_workflow(current_job.workflow, current_job.job_id);
 
         const ext = generated_file.endsWith('.png') ? 'png' : generated_file.endsWith('.webp') ? 'webp' : 'jpg';
-        const isolated_path = join(OUTPUT_DIR, `uploading_${current_job.job_id}.${ext}`);
+        const isolated_path = join(OUTPUT_DIR, `uploading_${WORKER_SUFFIX}_${current_job.job_id}.${ext}`);
         await rename(generated_file, isolated_path);
 
-        console.log(`[Job ${current_job.job_id}] Rendered in ${duration.toFixed(2)}s. Offloading background upload.`);
+        console.log(`[${WORKER_SUFFIX}] [Job ${current_job.job_id}] Rendered in ${duration.toFixed(2)}s. Starting async upload.`);
 
-        // 5. Fire background upload & continue immediately to Job N+1
         const upload_task = upload_and_complete_async(
           current_job.job_id,
           isolated_path,
@@ -466,25 +459,26 @@ const worker_loop = async () => {
         upload_task.finally(() => active_uploads.delete(upload_task));
 
       } catch (render_err) {
-        console.error(`[Job ${current_job.job_id}] Render failed:`, render_err.message);
+        console.error(`[${WORKER_SUFFIX}] [Job ${current_job.job_id}] Render failed:`, render_err.message);
         for (const path of current_job.downloaded_paths) {
-          try { await unlink(path); } catch (_) {}
+          if (path) {
+            try { await unlink(path); } catch (_) {}
+          }
         }
         try { await fail_job(current_job.job_id, render_err.message); } catch (_) {}
       }
 
-      // Free current slot so next loop immediately processes the prefetched Job N+1
       current_job = null;
 
     } catch (err) {
-      console.error('[Worker] Error in main loop:', err.message);
+      console.error(`[${WORKER_SUFFIX}] Error in loop:`, err.message);
       await sleep(POLL_INTERVAL_SECONDS * 1000);
     }
   }
 };
 
 const handle_exit = async () => {
-  console.log('[Worker] Termination signal received.');
+  console.log(`[${WORKER_SUFFIX}] Termination signal received.`);
   await flush_pending_uploads();
   await sync_stats_to_disk();
   process.exit(0);
@@ -494,6 +488,6 @@ process.on('SIGINT', handle_exit);
 process.on('SIGTERM', handle_exit);
 
 worker_loop().catch((err) => {
-  console.error('[Worker] Fatal exception:', err);
+  console.error(`[${WORKER_SUFFIX}] Fatal:`, err);
   process.exit(1);
 });
