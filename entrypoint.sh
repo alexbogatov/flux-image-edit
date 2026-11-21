@@ -39,6 +39,8 @@ elif [ -n "$VAST_CONTAINERLABEL" ] || [ -n "$CONTAINER_ID" ] || [ -n "$VAST_TCP_
     export RUNNER_PLATFORM="vastai"
 elif [ -n "$RUNPOD_POD_ID" ]; then
     export RUNNER_PLATFORM="runpod"
+elif [ -n "$LIUM_API_KEY" ] || [ -n "$LIUM_POD_ID" ] || [ -f "/etc/lium/pod.json" ]; then
+    export RUNNER_PLATFORM="lium"
 elif is_hyperstack; then
     export RUNNER_PLATFORM="hyperstack"
 else
@@ -283,6 +285,52 @@ if [ "$RUNNER_PLATFORM" = "hyperstack" ] && [ -n "$HYPERSTACK_API_KEY" ]; then
         echo "[Teardown] Hibernating VM ${VM_ID}..."
         curl -s -H "api_key: ${HYPERSTACK_API_KEY}" \
             "${HYPERSTACK_API_URL}/core/virtual-machines/${VM_ID}/hibernate?retain_ip=true" || true
+    fi
+
+# --- Lium Pod Deletion ---
+elif [ "$RUNNER_PLATFORM" = "lium" ]; then
+    echo "[Teardown] Shutting down Lium pod to prevent idle compute charges..."
+    LIUM_API_URL="${LIUM_API_URL:-https://lium.io/api}"
+
+    # Resolve pod id: explicit env, then Lium-injected vars, then hostname
+    LIUM_ID="${LIUM_POD_ID:-${LIUM_POD_UUID:-${HOSTNAME}}}"
+
+    if [ -z "$LIUM_API_KEY" ]; then
+        echo "[Teardown] LIUM_API_KEY not set; cannot delete pod. Terminating PID 1..."
+        kill -s TERM 1 2>/dev/null || true
+    else
+        echo "[Teardown] Resolving pod ${LIUM_ID} via ${LIUM_API_URL}/pods ..."
+        LIUM_RESOLVED_ID=$(curl -s --connect-timeout 5 -H "X-API-Key: ${LIUM_API_KEY}" \
+            "${LIUM_API_URL}/pods" | \
+            node -e "
+                const fs = require('fs');
+                const want = String(process.env.LIUM_WANT || '').toLowerCase();
+                try {
+                    const raw = fs.readFileSync(0, 'utf-8');
+                    const parsed = JSON.parse(raw);
+                    const list = Array.isArray(parsed) ? parsed : (parsed.pods || parsed.data || []);
+                    const pick = list.find(p => {
+                        const id = String(p.id ?? p.pod_id ?? p.uuid ?? '');
+                        const name = String(p.name ?? p.pod_name ?? '');
+                        return id === want || name.toLowerCase() === want;
+                    });
+                    if (pick) process.stdout.write(String(pick.id ?? pick.pod_id ?? pick.uuid));
+                } catch (_) {}
+            " LIUM_WANT="$LIUM_ID" 2>/dev/null || true)
+
+        TARGET_ID="${LIUM_RESOLVED_ID:-$LIUM_ID}"
+
+        if [ -n "$TARGET_ID" ]; then
+            echo "[Teardown] Deleting Lium pod ${TARGET_ID}..."
+            curl -s -X DELETE "${LIUM_API_URL}/pods/${TARGET_ID}" \
+                -H "X-API-Key: ${LIUM_API_KEY}" \
+                -H "accept: application/json" || true
+            echo "[Teardown] Delete requested. Terminating PID 1..."
+        else
+            echo "[Teardown] Could not resolve a pod id for '${LIUM_ID}'. Set LIUM_POD_ID explicitly."
+        fi
+
+        kill -s TERM 1 2>/dev/null || true
     fi
 
 # --- Vast.ai Stop Instance ---
