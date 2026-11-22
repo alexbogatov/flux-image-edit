@@ -35,8 +35,12 @@ let total_generation_time_sec = 0;
 const API_BASE_URL = process.env.API_BASE_URL || 'https://api.runltx.com';
 const JOB_TYPE = process.env.JOB_TYPE || 'generate';
 const MODEL_TYPE = process.env.MODEL_TYPE || 'image-edit';
-const POLL_INTERVAL_SECONDS = parseInt(process.env.POLL_INTERVAL_SECONDS, 10) || 1;
-const MAX_EMPTY_POLLS = parseInt(process.env.MAX_EMPTY_POLLS, 10) || 3;
+const POLL_INTERVAL_SECONDS = parseInt(process.env.POLL_INTERVAL_SECONDS, 10) || 5;
+// Idle budget: MAX_EMPTY_POLLS * POLL_INTERVAL_SECONDS seconds of confirmed-empty
+// queue before shutting down. 120 * 5s = 10 minutes. Only genuine 404 "no jobs"
+// responses count toward this; rate-limit/API errors do NOT.
+const MAX_EMPTY_POLLS = parseInt(process.env.MAX_EMPTY_POLLS, 10) || 120;
+const RATE_LIMIT_BACKOFF_SECONDS = parseInt(process.env.RATE_LIMIT_BACKOFF_SECONDS, 10) || 5;
 
 // R2 Storage Client Configuration
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID;
@@ -135,13 +139,26 @@ const poll_for_job = async () => {
       body: JSON.stringify(payload)
     });
 
-    if (response.status === 404) return null;
+    // 404 = server says the queue is genuinely empty. This is the ONLY case
+    // that should count toward the idle-shutdown budget.
+    if (response.status === 404) return { empty: true };
+
+    // 429 = we are polling too fast. Back off, but do NOT count as empty:
+    // jobs may well be available, we just are not allowed to ask right now.
+    if (response.status === 429) {
+      console.warn(`[${WORKER_SUFFIX}] [Rate limited] backing off ${RATE_LIMIT_BACKOFF_SECONDS}s`);
+      await sleep(RATE_LIMIT_BACKOFF_SECONDS * 1000);
+      return { empty: false, job: null };
+    }
+
     if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
 
-    return await response.json();
+    return { empty: false, job: await response.json() };
   } catch (err) {
+    // Network errors, 5xx, malformed JSON: transient. Never count toward shutdown.
     console.error(`[${WORKER_SUFFIX}] [API Poll Error]:`, err.message);
-    return null;
+    await sleep(RATE_LIMIT_BACKOFF_SECONDS * 1000);
+    return { empty: false, job: null };
   }
 };
 
@@ -365,25 +382,32 @@ const prepare_job = async (job_data) => {
   return { job_id, workflow, downloaded_paths, prompt };
 };
 
+// Returns { job, empty }:
+//   job   - prepared job, or null
+//   empty - true ONLY when the server confirmed there is no work (404).
+//           Transient failures leave this false so they cannot trigger shutdown.
 const prefetch_next_job = async () => {
   try {
     const result = await poll_for_job();
-    if (!result || !result.success || !result.data) {
-      return null;
+
+    if (result.empty) return { job: null, empty: true };
+
+    if (!result.job || !result.job.success || !result.job.data) {
+      return { job: null, empty: false };
     }
 
     try {
-      const prepared = await prepare_job(result.data);
+      const prepared = await prepare_job(result.job.data);
       console.log(`[${WORKER_SUFFIX}] [Prefetched Job ${prepared.job_id}] ${format_prompt_preview(prepared.prompt)}`);
-      return prepared;
+      return { job: prepared, empty: false };
     } catch (prep_err) {
-      console.error(`[${WORKER_SUFFIX}] [Job ${result.data.job_id}] Prep failed:`, prep_err.message);
-      try { await fail_job(result.data.job_id, prep_err.message); } catch (_) {}
-      return null;
+      console.error(`[${WORKER_SUFFIX}] [Job ${result.job.data.job_id}] Prep failed:`, prep_err.message);
+      try { await fail_job(result.job.data.job_id, prep_err.message); } catch (_) {}
+      return { job: null, empty: false };
     }
   } catch (err) {
     console.error(`[${WORKER_SUFFIX}] [Pipeline] Prefetch error:`, err.message);
-    return null;
+    return { job: null, empty: false };
   }
 };
 
@@ -407,22 +431,25 @@ const worker_loop = async () => {
   let prefetch_promise = null;
   let empty_poll_count = 0;
 
-  console.log(`[${WORKER_SUFFIX}] Polling every ${POLL_INTERVAL_SECONDS}s...`);
+  console.log(`[${WORKER_SUFFIX}] Polling every ${POLL_INTERVAL_SECONDS}s; idle budget ${MAX_EMPTY_POLLS} empty polls (~${Math.round(MAX_EMPTY_POLLS * POLL_INTERVAL_SECONDS / 60)} min)...`);
 
   while (true) {
     try {
       if (prefetch_promise) {
-        current_job = await prefetch_promise;
+        const prefetched = await prefetch_promise;
         prefetch_promise = null;
+        current_job = prefetched.job;
+        if (prefetched.empty) empty_poll_count++;
+      }
+
+      if (!current_job && !prefetch_promise) {
+        const polled = await prefetch_next_job();
+        current_job = polled.job;
+        if (polled.empty) empty_poll_count++;
       }
 
       if (!current_job) {
-        current_job = await prefetch_next_job();
-      }
-
-      if (!current_job) {
-        empty_poll_count++;
-        if (empty_poll_count % 5 === 0 || empty_poll_count === 1) {
+        if (empty_poll_count === 1 || empty_poll_count % 5 === 0) {
           console.log(`[${WORKER_SUFFIX}] Queue empty (${empty_poll_count}/${MAX_EMPTY_POLLS})`);
         }
 
