@@ -292,42 +292,43 @@ elif [ "$RUNNER_PLATFORM" = "lium" ]; then
     echo "[Teardown] Shutting down Lium pod to prevent idle compute charges..."
     LIUM_API_URL="${LIUM_API_URL:-https://lium.io/api}"
 
-    # Resolve pod id: explicit env, then Lium-injected vars, then hostname
-    LIUM_ID="${LIUM_POD_ID:-${LIUM_POD_UUID:-${HOSTNAME}}}"
-
     if [ -z "$LIUM_API_KEY" ]; then
         echo "[Teardown] LIUM_API_KEY not set; cannot delete pod. Terminating PID 1..."
         kill -s TERM 1 2>/dev/null || true
     else
-        echo "[Teardown] Resolving pod ${LIUM_ID} via ${LIUM_API_URL}/pods ..."
-        LIUM_RESOLVED_ID=$(curl -s --connect-timeout 5 -H "X-API-Key: ${LIUM_API_KEY}" \
-            "${LIUM_API_URL}/pods" | \
-            node -e "
-                const fs = require('fs');
-                const want = String(process.env.LIUM_WANT || '').toLowerCase();
-                try {
-                    const raw = fs.readFileSync(0, 'utf-8');
-                    const parsed = JSON.parse(raw);
-                    const list = Array.isArray(parsed) ? parsed : (parsed.pods || parsed.data || []);
-                    const pick = list.find(p => {
-                        const id = String(p.id ?? p.pod_id ?? p.uuid ?? '');
-                        const name = String(p.name ?? p.pod_name ?? '');
-                        return id === want || name.toLowerCase() === want;
-                    });
-                    if (pick) process.stdout.write(String(pick.id ?? pick.pod_id ?? pick.uuid));
-                } catch (_) {}
-            " LIUM_WANT="$LIUM_ID" 2>/dev/null || true)
+        # Lium pod IDs are 32-char UUIDs. $HOSTNAME inside the pod is a 12-char
+        # container id and will ALWAYS be rejected by the API (422 uuid_parsing),
+        # so it is never used as a fallback.
+        LIUM_ID="${LIUM_POD_ID:-${LIUM_POD_UUID:-}}"
 
-        TARGET_ID="${LIUM_RESOLVED_ID:-$LIUM_ID}"
+        # Optional: resolve by pod name when LIUM_POD_NAME is supplied.
+        if [ -z "$LIUM_ID" ] && [ -n "$LIUM_POD_NAME" ]; then
+            echo "[Teardown] Resolving pod by name '${LIUM_POD_NAME}' via ${LIUM_API_URL}/pods ..."
+            LIUM_ID=$(curl -s --connect-timeout 5 -H "X-API-Key: ${LIUM_API_KEY}" \
+                "${LIUM_API_URL}/pods" | \
+                node -e "
+                    const fs = require('fs');
+                    const want = String(process.env.LIUM_WANT || '').toLowerCase();
+                    try {
+                        const raw = fs.readFileSync(0, 'utf-8');
+                        const parsed = JSON.parse(raw);
+                        const list = Array.isArray(parsed) ? parsed : (parsed.pods || parsed.data || []);
+                        const pick = list.find(p => String(p.name ?? p.pod_name ?? '').toLowerCase() === want);
+                        if (pick) process.stdout.write(String(pick.id ?? p.pod_id ?? p.uuid ?? ''));
+                    } catch (_) {}
+                " LIUM_WANT="$LIUM_POD_NAME" 2>/dev/null || true)
+        fi
 
-        if [ -n "$TARGET_ID" ]; then
-            echo "[Teardown] Deleting Lium pod ${TARGET_ID}..."
-            curl -s -X DELETE "${LIUM_API_URL}/pods/${TARGET_ID}" \
+        if [[ "$LIUM_ID" =~ ^[0-9a-fA-F]{32}$ ]]; then
+            echo "[Teardown] Deleting Lium pod ${LIUM_ID}..."
+            RESP=$(curl -s -X DELETE "${LIUM_API_URL}/pods/${LIUM_ID}" \
                 -H "X-API-Key: ${LIUM_API_KEY}" \
-                -H "accept: application/json" || true
-            echo "[Teardown] Delete requested. Terminating PID 1..."
+                -H "accept: application/json" || true)
+            echo "[Teardown] Response: ${RESP}"
         else
-            echo "[Teardown] Could not resolve a pod id for '${LIUM_ID}'. Set LIUM_POD_ID explicitly."
+            echo "[Teardown] No valid 32-char pod UUID available (got '${LIUM_ID:-<unset>}')."
+            echo "[Teardown] Set LIUM_POD_ID in .env to enable self-deletion."
+            echo "[Teardown] The pod will keep billing until stopped from the Lium dashboard."
         fi
 
         kill -s TERM 1 2>/dev/null || true
