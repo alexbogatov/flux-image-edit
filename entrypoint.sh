@@ -296,39 +296,26 @@ elif [ "$RUNNER_PLATFORM" = "lium" ]; then
         echo "[Teardown] LIUM_API_KEY not set; cannot delete pod. Terminating PID 1..."
         kill -s TERM 1 2>/dev/null || true
     else
-        # Lium pod IDs are 32-char UUIDs. $HOSTNAME inside the pod is a 12-char
-        # container id and will ALWAYS be rejected by the API (422 uuid_parsing),
-        # so it is never used as a fallback.
+        # Identity comes only from LIUM_POD_ID, written by the deploy script. It
+        # is never inferred: $HOSTNAME is a 12-char container id that the API
+        # rejects (422 uuid_parsing), and a name lookup from inside the pod
+        # cannot reliably single this pod out - guessing wrong would delete
+        # somebody else's pod on idle teardown.
         LIUM_ID="${LIUM_POD_ID:-${LIUM_POD_UUID:-}}"
 
-        # Optional: resolve by pod name when LIUM_POD_NAME is supplied.
-        if [ -z "$LIUM_ID" ] && [ -n "$LIUM_POD_NAME" ]; then
-            echo "[Teardown] Resolving pod by name '${LIUM_POD_NAME}' via ${LIUM_API_URL}/pods ..."
-            LIUM_ID=$(curl -s --connect-timeout 5 -H "X-API-Key: ${LIUM_API_KEY}" \
-                "${LIUM_API_URL}/pods" | \
-                node -e "
-                    const fs = require('fs');
-                    const want = String(process.env.LIUM_WANT || '').toLowerCase();
-                    try {
-                        const raw = fs.readFileSync(0, 'utf-8');
-                        const parsed = JSON.parse(raw);
-                        const list = Array.isArray(parsed) ? parsed : (parsed.pods || parsed.data || []);
-                        const pick = list.find(p => String(p.name ?? p.pod_name ?? '').toLowerCase() === want);
-                        if (pick) process.stdout.write(String(pick.id ?? p.pod_id ?? p.uuid ?? ''));
-                    } catch (_) {}
-                " LIUM_WANT="$LIUM_POD_NAME" 2>/dev/null || true)
-        fi
-
-        if [[ "$LIUM_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        if [ -z "$LIUM_ID" ]; then
+            echo "[Teardown] LIUM_POD_ID is empty; skipping Lium API delete."
+            echo "[Teardown] Set LIUM_POD_ID in .env at deploy time to enable self-deletion."
+            echo "[Teardown] The pod will keep billing until stopped from the Lium dashboard."
+        elif [[ "$LIUM_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
             echo "[Teardown] Deleting Lium pod ${LIUM_ID}..."
             RESP=$(curl -s -X DELETE "${LIUM_API_URL}/pods/${LIUM_ID}" \
                 -H "X-API-Key: ${LIUM_API_KEY}" \
                 -H "accept: application/json" || true)
             echo "[Teardown] Response: ${RESP}"
         else
-            echo "[Teardown] No valid 32-char pod UUID available (got '${LIUM_ID:-<unset>}')."
-            echo "[Teardown] Set LIUM_POD_ID in .env to enable self-deletion."
-            echo "[Teardown] The pod will keep billing until stopped from the Lium dashboard."
+            echo "[Teardown] LIUM_POD_ID is not a valid 36-char UUID (got '${LIUM_ID}')."
+            echo "[Teardown] Refusing to delete; stop the pod from the Lium dashboard."
         fi
 
         kill -s TERM 1 2>/dev/null || true
