@@ -4,7 +4,7 @@ set -eo pipefail
 export GIT_TERMINAL_PROMPT=0
 
 echo "===================================================="
-echo "[Startup] Initializing Dual Flux.2 Klein Image Workers"
+echo "[Startup] Initializing Flux.2 Klein Image Worker(s)"
 echo "===================================================="
 
 # ==============================================================================
@@ -62,6 +62,7 @@ API_BASE_URL="${API_BASE_URL:-https://api.runltx.com}"
 
 echo "[Platform] Runtime  : $RUNNER_PLATFORM"
 echo "[Hardware] GPU Model: $RUNNER_GPU_NAME ($RUNNER_GPU_COUNT detected, $RUNNER_GPU_VRAM VRAM)"
+echo "[Config]   Instances: ${COMFY_INSTANCES:-1} (override with COMFY_INSTANCES)"
 echo "===================================================="
 
 # ==============================================================================
@@ -164,59 +165,101 @@ download_if_missing "${MODEL_DIR}/clip" "qwen_3_4b.safetensors" "https://hugging
 download_if_missing "${MODEL_DIR}/vae" "full_encoder_small_decoder.safetensors" "https://huggingface.co/black-forest-labs/FLUX.2-small-decoder/resolve/main/full_encoder_small_decoder.safetensors"
 
 # ==============================================================================
-# 5. Launch Dual ComfyUI & Dual Node Daemons in Parallel
+# 5. Launch ComfyUI Instances & Node Daemons
 # ==============================================================================
-pkill -f "main.py" || true
+# Instance count is explicit: COMFY_INSTANCES, default 1.
+#
+# Why default 1: this image is deployed on single-GPU pods (L40S 46 GB). Two
+# ComfyUI instances on one GPU each hold a ~15 GB copy of UNET+text encoder and
+# time-slice the SMs. Measured on an L40S: two instances -> ~31s/job, one
+# instance -> ~14.7s/job. Throughput is the same either way, but per-job
+# latency doubles and VRAM headroom halves. Only raise this to 2 when the pod
+# genuinely has 2+ GPUs and you pin one instance per GPU.
+COMFY_INSTANCES="${COMFY_INSTANCES:-1}"
+if ! [[ "$COMFY_INSTANCES" =~ ^[0-9]+$ ]] || [ "$COMFY_INSTANCES" -lt 1 ]; then
+    echo "[Startup] Invalid COMFY_INSTANCES='${COMFY_INSTANCES}' (expected >= 1). Falling back to 1."
+    COMFY_INSTANCES=1
+fi
+
+GPU_COUNT_NUM=$(echo "${RUNNER_GPU_COUNT:-1}" | grep -oE '^[0-9]+' || echo 1)
+if [ "$COMFY_INSTANCES" -gt "$GPU_COUNT_NUM" ]; then
+    echo "[Startup] WARNING: COMFY_INSTANCES=${COMFY_INSTANCES} but only ${GPU_COUNT_NUM} GPU(s) detected."
+    echo "[Startup]          Instances will share the GPU(s) and render slower per job."
+fi
+
+# Kill any stale ComfyUI from a previous run. `pkill` is NOT available in this
+# image (no procps package), so use the bash builtin over /proc cmdlines.
+for p in /proc/[0-9]*; do
+    pid=${p#/proc/}
+    [ "$pid" = "$$" ] && continue
+    if tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -q "ComfyUI/main.py"; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+done
 rm -f /app/ComfyUI/user/comfyui.db.lock || true
 cd /app
 
-# Launch ComfyUI Instance 1 (Port 8188)
-/opt/venv/bin/python3 /app/ComfyUI/main.py \
-    --listen 0.0.0.0 --port 8188 --gpu-only --fast --use-sage-attention --disable-auto-launch \
-    > /var/log/flux/comfy_1.log 2>&1 &
-COMFY_PID_1=$!
+COMFY_PIDS=()
+WORKER_PIDS=()
 
-# Launch ComfyUI Instance 2 (Port 8189)
-/opt/venv/bin/python3 /app/ComfyUI/main.py \
-    --listen 0.0.0.0 --port 8189 --gpu-only --fast --use-sage-attention --disable-auto-launch \
-    > /var/log/flux/comfy_2.log 2>&1 &
-COMFY_PID_2=$!
-
-echo "[Startup] Waiting for ComfyUI instances on ports 8188 and 8189..."
-until curl -s http://127.0.0.1:8188/history > /dev/null 2>&1 && \
-      curl -s http://127.0.0.1:8189/history > /dev/null 2>&1; do
-    sleep 1
+for i in $(seq 1 "$COMFY_INSTANCES"); do
+    PORT=$((8187 + i))
+    /opt/venv/bin/python3 /app/ComfyUI/main.py \
+        --listen 0.0.0.0 --port "$PORT" --gpu-only --fast --use-sage-attention --disable-auto-launch \
+        > "/var/log/flux/comfy_${i}.log" 2>&1 &
+    COMFY_PIDS+=($!)
+    echo "[Startup] ComfyUI instance ${i}/${COMFY_INSTANCES} launched on port ${PORT} (pid $!)."
 done
-echo "[Startup] Both ComfyUI runtimes online."
 
-# Launch Worker Daemon 1
-COMFY_PORT=8188 WORKER_SUFFIX="worker_1" node worker.js > /var/log/flux/worker_1.log 2>&1 &
-WORKER_PID_1=$!
+echo "[Startup] Waiting for ComfyUI instance(s)..."
+for i in $(seq 1 "$COMFY_INSTANCES"); do
+    PORT=$((8187 + i))
+    until curl -s "http://127.0.0.1:${PORT}/history" > /dev/null 2>&1; do
+        sleep 1
+    done
+done
+echo "[Startup] All ${COMFY_INSTANCES} ComfyUI runtime(s) online."
 
-# Launch Worker Daemon 2
-COMFY_PORT=8189 WORKER_SUFFIX="worker_2" node worker.js > /var/log/flux/worker_2.log 2>&1 &
-WORKER_PID_2=$!
+for i in $(seq 1 "$COMFY_INSTANCES"); do
+    PORT=$((8187 + i))
+    COMFY_PORT="$PORT" WORKER_SUFFIX="worker_${i}" node worker.js \
+        > "/var/log/flux/worker_${i}.log" 2>&1 &
+    WORKER_PIDS+=($!)
+done
 
-echo "[Startup] Both workers running. Tail logs with:"
-echo "  sudo docker exec -it <container> tail -f /var/log/flux/worker_1.log"
-echo "  sudo docker exec -it <container> tail -f /var/log/flux/worker_2.log"
+echo "===================================================="
+echo "[Startup] ${COMFY_INSTANCES} worker(s) running. Follow logs with:"
+# ${HOSTNAME} is the container id, which docker accepts as the container name.
+for i in $(seq 1 "$COMFY_INSTANCES"); do
+    echo "  docker exec -it ${HOSTNAME} tail -f /var/log/flux/worker_${i}.log"
+    echo "  docker exec -it ${HOSTNAME} tail -f /var/log/flux/comfy_${i}.log"
+done
+echo "  (all at once) docker exec -it ${HOSTNAME} tail -f /var/log/flux/comfy_1.log /var/log/flux/worker_1.log"
+echo "  (from host)   docker logs -f ${HOSTNAME}"
+echo "===================================================="
 
-# Wait for both workers to finish
-wait $WORKER_PID_1
-WORKER_EXIT_CODE_1=$?
+# COMFY_TAIL_LOGS=1 streams ComfyUI logs into `docker logs` so no exec is needed.
+# Off by default: the stream is verbose (tqdm progress bars) and would bloat the
+# container log rotation.
+if [ "${COMFY_TAIL_LOGS:-0}" = "1" ]; then
+    echo "[Startup] COMFY_TAIL_LOGS=1 - streaming ComfyUI logs into docker logs."
+    for i in $(seq 1 "$COMFY_INSTANCES"); do
+        ( tail -F "/var/log/flux/comfy_${i}.log" 2>/dev/null | sed -u "s/^/[comfy_${i}] /" ) &
+    done
+fi
 
-wait $WORKER_PID_2
-WORKER_EXIT_CODE_2=$?
+# Wait for every worker daemon to finish
+WORKER_EXIT_CODE=0
+for pid in "${WORKER_PIDS[@]}"; do
+    wait "$pid"
+    code=$?
+    if [ "$code" -ne 0 ] && [ "$WORKER_EXIT_CODE" -eq 0 ]; then
+        WORKER_EXIT_CODE=$code
+    fi
+done
 
 # Teardown ComfyUI instances
-kill -9 $COMFY_PID_1 $COMFY_PID_2 2>/dev/null || true
-
-# Determine exit code
-if [ $WORKER_EXIT_CODE_1 -ne 0 ]; then
-    WORKER_EXIT_CODE=$WORKER_EXIT_CODE_1
-else
-    WORKER_EXIT_CODE=$WORKER_EXIT_CODE_2
-fi
+kill -9 "${COMFY_PIDS[@]}" 2>/dev/null || true
 
 # ==============================================================================
 # 6. Aggregate Stats & Finalize Session
