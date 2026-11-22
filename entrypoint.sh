@@ -319,7 +319,7 @@ elif [ "$RUNNER_PLATFORM" = "lium" ]; then
                 " LIUM_WANT="$LIUM_POD_NAME" 2>/dev/null || true)
         fi
 
-        if [[ "$LIUM_ID" =~ ^[0-9a-fA-F]{32}$ ]]; then
+        if [[ "$LIUM_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
             echo "[Teardown] Deleting Lium pod ${LIUM_ID}..."
             RESP=$(curl -s -X DELETE "${LIUM_API_URL}/pods/${LIUM_ID}" \
                 -H "X-API-Key: ${LIUM_API_KEY}" \
